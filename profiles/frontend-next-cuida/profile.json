@@ -1,0 +1,12 @@
+{
+  "name": "frontend-next-cuida",
+  "description": "frontend web developer",
+  "stack": [
+    "TypeScript",
+    "Next",
+    "algolia",
+    "React",
+    "Query",
+    "saleor"
+  ]
+}

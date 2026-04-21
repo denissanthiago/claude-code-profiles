@@ -1,8 +1,8 @@
 {
   "addyosmani/agent-skills": {
     "source": "https://github.com/addyosmani/agent-skills",
-    "commit": "44dac80216da709913fb410f632a65547866346f",
-    "installed_at": "2026-04-20T07:02:52Z",
+    "commit": "1f66d57a5e1b041b11e49a8cdca275aa472f0131",
+    "installed_at": "2026-04-21T17:12:49Z",
     "files": [
       "skills/api-and-interface-design",
       "skills/browser-testing-with-devtools",
@@ -25,6 +25,7 @@
       "skills/spec-driven-development",
       "skills/test-driven-development",
       "skills/using-agent-skills",
+      "agents/README.md",
       "agents/code-reviewer.md",
       "agents/security-auditor.md",
       "agents/test-engineer.md",
@@ -36,6 +37,7 @@
       "commands/spec.md",
       "commands/test.md",
       "references/accessibility-checklist.md",
+      "references/orchestration-patterns.md",
       "references/performance-checklist.md",
       "references/security-checklist.md",
       "references/testing-patterns.md",
