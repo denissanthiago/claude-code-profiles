@@ -31,8 +31,19 @@
 
 set -euo pipefail
 
+# ---------- Paths (resolve symlinks so ccp funciona vía ~/.local/bin/ccp) ----------
+_ccp_src="${BASH_SOURCE[0]}"
+while [[ -L "$_ccp_src" ]]; do
+  _ccp_dir="$(cd -P "$(dirname "$_ccp_src")" && pwd)"
+  _ccp_src="$(readlink "$_ccp_src")"
+  [[ "$_ccp_src" != /* ]] && _ccp_src="$_ccp_dir/$_ccp_src"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_ccp_src")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+unset _ccp_src _ccp_dir
+
 # ---------- Source UI lib ----------
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/cyber-ui.sh"
+source "$SCRIPT_DIR/lib/cyber-ui.sh"
 
 usage() {
   banner "ccp ▸ Claude Code Profiles" "gestión + aplicación en una sola herramienta"
@@ -94,9 +105,7 @@ usage() {
   echo
 }
 
-# ---------- Paths ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# ---------- Paths (SCRIPT_DIR / REPO_ROOT ya resueltos arriba) ----------
 PROFILES_DIR="$REPO_ROOT/profiles"
 DRAFTS_DIR="$REPO_ROOT/drafts"
 DRAFTS_HISTORY="$DRAFTS_DIR/.history.json"
