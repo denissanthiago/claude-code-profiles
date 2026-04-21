@@ -1,0 +1,12 @@
+# Claude Code — personal/local config (no compartir con el equipo)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
+
+# Node (por si a futuro se agrega tooling aquí)
+node_modules/

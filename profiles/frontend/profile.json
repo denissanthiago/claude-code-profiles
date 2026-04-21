@@ -1,0 +1,14 @@
+{
+  "name": "frontend",
+  "description": "Frontend web — React + TypeScript + Next.js/Vite + Tailwind",
+  "stack": [
+    "React",
+    "TypeScript",
+    "Next.js",
+    "Vite",
+    "Tailwind CSS",
+    "shadcn/ui",
+    "Vitest",
+    "Playwright"
+  ]
+}

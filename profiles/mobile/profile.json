@@ -1,0 +1,13 @@
+{
+  "name": "mobile",
+  "description": "Mobile development — React Native (iOS + Android) + TypeScript",
+  "stack": [
+    "React Native",
+    "TypeScript",
+    "Expo",
+    "iOS (Xcode + CocoaPods)",
+    "Android (Gradle)",
+    "Jest",
+    "React Native Testing Library"
+  ]
+}

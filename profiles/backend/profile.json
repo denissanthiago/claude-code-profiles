@@ -1,0 +1,13 @@
+{
+  "name": "backend",
+  "description": "Backend + DB + infraestructura (Node/Bun + TypeScript + Postgres + Docker)",
+  "stack": [
+    "Node.js",
+    "Bun",
+    "TypeScript",
+    "PostgreSQL",
+    "Prisma",
+    "Docker",
+    "Vitest"
+  ]
+}

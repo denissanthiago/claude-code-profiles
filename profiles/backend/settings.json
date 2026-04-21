@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm *)",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(bun *)",
+      "Bash(yarn *)",
+      "Bash(npx tsc *)",
+      "Bash(npx vitest *)",
+      "Bash(npx prisma *)",
+      "Bash(npx drizzle-kit *)",
+      "Bash(docker compose ps)",
+      "Bash(docker compose up *)",
+      "Bash(docker compose down)",
+      "Bash(docker compose logs *)",
+      "Bash(docker compose exec *)",
+      "Bash(docker compose build *)",
+      "Bash(docker ps)",
+      "Bash(docker logs *)",
+      "Bash(psql -l)",
+      "Bash(psql -c *)",
+      "Bash(psql -d * -c *)",
+      "Bash(curl -s http://localhost:*)",
+      "Bash(curl -s -X GET http://localhost:*)",
+      "Bash(curl -s -X POST http://localhost:*)"
+    ],
+    "deny": [
+      "Edit(.env*)",
+      "Write(.env*)",
+      "Edit(*-lock.*)",
+      "Edit(./data/**)",
+      "Write(./data/**)",
+      "Edit(./migrations/applied/**)",
+      "Write(./migrations/applied/**)",
+      "Edit(node_modules/**)",
+      "Bash(docker system prune *)",
+      "Bash(docker volume rm *)",
+      "Bash(docker volume prune *)",
+      "Bash(psql -c DROP*)",
+      "Bash(psql -c \"DROP*)",
+      "Bash(dropdb *)",
+      "Bash(git push origin main *)",
+      "Bash(git push origin master *)"
+    ]
+  }
+}

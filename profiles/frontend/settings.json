@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm *)",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(bun *)",
+      "Bash(yarn *)",
+      "Bash(npx tsc *)",
+      "Bash(npx vitest *)",
+      "Bash(npx playwright *)",
+      "Bash(npx next *)",
+      "Bash(npx vite *)",
+      "Bash(npx eslint *)",
+      "Bash(npx prettier *)",
+      "Bash(npx biome *)",
+      "Bash(curl -s http://localhost:*)"
+    ],
+    "deny": [
+      "Edit(.env*)",
+      "Write(.env*)",
+      "Edit(*-lock.*)",
+      "Edit(.next/**)",
+      "Edit(dist/**)",
+      "Edit(build/**)",
+      "Edit(.output/**)",
+      "Edit(.vite/**)",
+      "Edit(node_modules/**)",
+      "Write(.next/**)",
+      "Write(dist/**)",
+      "Write(build/**)",
+      "Write(.output/**)",
+      "Write(node_modules/**)",
+      "Bash(git push origin main *)",
+      "Bash(git push origin master *)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/scripts/session-start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "video-creator",
+  "description": "Creación de videos con animaciones (librería por definir)",
+  "stack": [
+    "TypeScript",
+    "Node.js",
+    "TODO: librería de animación (Remotion / Motion Canvas / GSAP / Rive / Framer Motion)"
+  ],
+  "status": "placeholder — stack pendiente de decisión"
+}

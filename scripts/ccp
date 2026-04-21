@@ -1,0 +1,3210 @@
+#!/usr/bin/env bash
+#
+# ccp — gestiona recursos dentro de perfiles (packs + CRUD + inventario).
+#
+# Packs (externos):
+#   ccp pack install <profile> <github-url>      Clona e instala un pack
+#   ccp pack update  <profile> <pack-name>       Re-clona y actualiza
+#   ccp pack remove  <profile> <pack-name>       Borra archivos del pack
+#   ccp pack list    <profile>                   Lista packs instalados
+#   ccp pack adopt   <profile> <github-url>      Manifest retroactivo
+#
+# Recursos individuales (CRUD):
+#   ccp <type> add    <profile> <name>           Agrega un recurso (template)
+#   ccp <type> remove <profile> <name>           Borra un recurso
+#   ccp <type> list   <profile>                  Lista recursos del tipo
+#     donde <type> ∈ { skill, agent, command, rule, reference, script, mcp }
+#
+#   Para MCPs (variante con JSON completo):
+#   ccp mcp add      <profile> <name> <command> [args]...
+#   ccp mcp add-json <profile> <name> '<json-config>'
+#
+# Inventario:
+#   ccp inventory <profile>                      Resumen completo del perfil
+#
+# Ayuda:
+#   ccp --help
+#
+# El manifest se guarda en profiles/<profile>/.packs.json
+# Recursos que vienen de packs no se pueden add/remove directo — usa pack commands.
+# Después de modificar, re-aplicá con scripts/apply-ccp [--force] <profile>
+
+set -euo pipefail
+
+# ---------- Source UI lib ----------
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/cyber-ui.sh"
+
+usage() {
+  banner "ccp ▸ Claude Code Profiles" "gestión + aplicación en una sola herramienta"
+
+  subhead "APPLY" "aplicá un perfil al directorio actual (repo target)"
+  item "apply <profile> [--force|--dry-run|--uninstall]" "copia rules/skills/agents/... a \$PWD/.claude/"
+  echo
+
+  subhead "PROFILE" "gestión de perfiles"
+  item "profile create <name> [--description X] [--stack A,B]" "crea un perfil nuevo (scaffold)"
+  item "profile list"                                          "lista perfiles disponibles"
+  echo
+
+  subhead "DRAFTS" "creación de recursos asistida por IA (claude CLI)"
+  item "draft create  <type> <name>"          "genera un skill/rule/... con Claude, en un workspace global"
+  item "draft refine  <type> <name>"          "retoma un draft existente (REPL con la IA)"
+  item "draft list    [--all]"                "muestra drafts pendientes (con --all también historial)"
+  item "draft install <type> <name> <profile[,profile2...]>" "instala un draft en uno o varios perfiles"
+  item "draft discard <type> <name>"          "descarta un draft sin instalar"
+  item "draft history"                        "log de drafts instalados"
+  echo
+
+  subhead "PACKS" "externos (repos de GitHub)"
+  item "pack install  <profile> <github-url>"  "clona e instala un pack externo"
+  item "pack update   <profile> <pack-name>"   "trae la última versión"
+  item "pack remove   <profile> <pack-name>"   "desinstala sólo los archivos del pack"
+  item "pack list     <profile>"               "lista packs con breakdown por tipo"
+  item "pack adopt    <profile> <github-url>"  "manifest retroactivo (si ya los copiaste a mano)"
+  echo
+
+  subhead "CRUD" "recursos individuales"
+  item "<type> add     <profile> <name>"                 "crea con template mínimo"
+  item "<type> add     <profile> <name> --from <src>"    "descarga desde GitHub URL o path local (file/dir)"
+  item "<type> remove  <profile> <name>"                 "borra (bloqueado si viene de un pack)"
+  item "<type> list    <profile>"                        "lista items con descripciones"
+  printf "\n      %btypes:%b skill · agent · command · rule · reference · script · mcp\n\n" \
+    "$C_GRAY" "$C_RESET"
+
+  item "mcp add      <profile> <name> <cmd> [args]..."   "forma rápida (sin env vars)"
+  item "mcp add-json <profile> <name> '<json>'"          "JSON completo (con env vars)"
+  echo
+
+  subhead "INVENTORY" ""
+  item "inventory <profile>"                   "resumen completo del perfil con barras visuales"
+  echo
+
+  subhead "AYUDA" ""
+  item "--help · -h"                           "esta pantalla"
+  echo
+
+  hr "─" "$C_DARK"
+  printf "  %bpack manifest%b   %b%s%b\n" \
+    "$C_GRAY" "$C_RESET" "$C_ACID" "profiles/<profile>/.packs.json" "$C_RESET"
+  printf "  %btarget manifest%b %b%s%b  (en el repo target)\n" \
+    "$C_GRAY" "$C_RESET" "$C_ACID" ".claude/.applied-profiles.json" "$C_RESET"
+  printf "  %bpropagar%b        %b%s%b   (desde el repo target)\n" \
+    "$C_GRAY" "$C_RESET" "$C_ACID" "ccp apply --force <profile>" "$C_RESET"
+  hr "─" "$C_DARK"
+  echo
+}
+
+# ---------- Paths ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROFILES_DIR="$REPO_ROOT/profiles"
+DRAFTS_DIR="$REPO_ROOT/drafts"
+DRAFTS_HISTORY="$DRAFTS_DIR/.history.json"
+
+# ---------- Prereqs ----------
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    [[ "${2:-}" ]] && echo "  Instalá: $2" >&2
+    die "'$1' no está instalado."
+  fi
+}
+
+# Muere limpiando el clone temporal de GitHub (si existe).
+# Úsalo dentro de cmd_*_add con --from para evitar leaks.
+# Sin mensaje o mensaje vacío, simplemente sale (fetch ya habrá logueado su propio error).
+die_gh() {
+  github_cleanup 2>/dev/null || true
+  if [[ $# -eq 0 || -z "${1:-}" ]]; then
+    exit 1
+  fi
+  die "$@"
+}
+
+# ---------- Layout central ----------
+# Tablas declarativas consumidas por enumerate_pack_files, copy_pack_file,
+# github_locate, y apply-ccp (vía KIND_DIRS_<type> en env si querés reuse).
+# Al agregar una ubicación nueva, tocás acá UNA vez.
+#
+# KIND_DIRS   : lista ordenada de paths (relativos al clone) donde se buscan recursos.
+#               Orden = prioridad (primera que matchee gana en dedupe).
+# KIND_EXT    : extensión esperada del archivo ("" = dir con marker como SKILL.md).
+# KIND_MARKER : archivo marker que define el recurso (sólo para skills).
+# KIND_SUBDIR : nombre de la carpeta destino en el perfil.
+KIND_DIRS_skill="skills skills/.curated skills/.experimental skills/.system .claude/skills"
+KIND_DIRS_agent="agents .claude/agents"
+KIND_DIRS_command="commands .claude/commands"
+KIND_DIRS_rule="rules .claude/rules"
+KIND_DIRS_reference="references .claude/references"
+KIND_DIRS_script="hooks scripts .claude/scripts"
+
+KIND_EXT_skill=""
+KIND_EXT_agent=".md"
+KIND_EXT_command=".md"
+KIND_EXT_rule=".md"
+KIND_EXT_reference=".md"
+KIND_EXT_script=".sh"
+# Scripts también matchean .md (docs de hook)
+KIND_EXT_script_extra=".md"
+
+KIND_MARKER_skill="SKILL.md"
+
+KIND_SUBDIR_skill="skills"
+KIND_SUBDIR_agent="agents"
+KIND_SUBDIR_command="commands"
+KIND_SUBDIR_rule="rules"
+KIND_SUBDIR_reference="references"
+KIND_SUBDIR_script="scripts"
+
+# Accessors con fallback vacío. Usar como:  kind_dirs skill  → "skills ..."
+kind_dirs()   { local v="KIND_DIRS_$1";   echo "${!v:-}"; }
+kind_ext()    { local v="KIND_EXT_$1";    echo "${!v:-}"; }
+kind_marker() { local v="KIND_MARKER_$1"; echo "${!v:-}"; }
+kind_subdir() { local v="KIND_SUBDIR_$1"; echo "${!v:-}"; }
+
+# ---------- Helpers ----------
+
+# Extrae "owner/repo" desde una URL de GitHub (ignora /tree/... /blob/... y trailing).
+# https://github.com/foo/bar                   → foo/bar
+# https://github.com/foo/bar.git               → foo/bar
+# https://github.com/foo/bar/tree/dev          → foo/bar
+# https://github.com/foo/bar/tree/main/sub     → foo/bar
+# https://github.com/foo/bar/blob/main/x.md    → foo/bar
+# git@github.com:foo/bar                       → foo/bar
+pack_name_from_url() {
+  local url="$1"
+  # Strip prefix, .git suffix, trailing slash
+  url="${url#https://github.com/}"
+  url="${url#http://github.com/}"
+  url="${url#git@github.com:}"
+  url="${url%.git}"
+  url="${url%/}"
+  # Si hay /tree/ o /blob/ después de owner/repo, truncar
+  local owner="${url%%/*}"
+  local rest="${url#"$owner"/}"
+  local repo="${rest%%/*}"
+  printf "%s/%s\n" "$owner" "$repo"
+}
+
+profile_dir_or_fail() {
+  local profile="$1"
+  local dir="$PROFILES_DIR/$profile"
+  if [[ ! -d "$dir" ]]; then
+    log_err "Perfil no encontrado: $profile"
+    log_info "Perfiles disponibles:"
+    for d in "$PROFILES_DIR"/*/; do
+      [[ -d "$d" ]] || continue
+      local n; n="$(basename "$d")"
+      [[ "$n" == "_"* ]] && continue
+      echo "  - $n"
+    done
+    exit 1
+  fi
+  echo "$dir"
+}
+
+manifest_path() {
+  local profile="$1"
+  echo "$PROFILES_DIR/$profile/.packs.json"
+}
+
+# Lee el manifest (devuelve "{}" si no existe)
+read_manifest() {
+  local path; path="$(manifest_path "$1")"
+  if [[ -f "$path" ]]; then
+    cat "$path"
+  else
+    echo '{}'
+  fi
+}
+
+pack_is_installed() {
+  local profile="$1" pack_name="$2"
+  read_manifest "$profile" | jq -e --arg p "$pack_name" '.[$p]' >/dev/null 2>&1
+}
+
+# Escribe el manifest (objeto JSON completo vía stdin)
+write_manifest() {
+  local profile="$1"
+  local path; path="$(manifest_path "$profile")"
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp"
+  # Si el manifest quedó vacío, borramos el archivo
+  if [[ "$(jq 'length' "$tmp")" == "0" ]]; then
+    rm -f "$path"
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$path"
+  fi
+}
+
+# Dado un directorio clone (tmp) y un directorio perfil (target),
+# devuelve en stdout las rutas relativas (al perfil) de los archivos que vendrían del pack.
+# Mapping:
+#   clone/skills/<n>/      → profile/skills/<n>/
+#   clone/agents/*.md      → profile/agents/*.md
+#   clone/rules/*.md       → profile/rules/*.md
+#   clone/references/*.md  → profile/references/*.md
+#   clone/commands/*.md    → profile/commands/*.md
+#   clone/.claude/commands/*.md → profile/commands/*.md
+#   clone/hooks/*.sh       → profile/scripts/*.sh
+#   clone/hooks/*.md       → profile/scripts/*.md (docs)
+enumerate_pack_files() {
+  local clone="$1"
+  {
+    local kind base d f subdir marker ext extra
+    for kind in skill agent command rule reference script; do
+      subdir="$(kind_subdir "$kind")"
+      marker="$(kind_marker "$kind")"
+      ext="$(kind_ext "$kind")"
+      extra=""
+      [[ "$kind" == "script" ]] && extra="${KIND_EXT_script_extra:-}"
+
+      for base in $(kind_dirs "$kind"); do
+        [[ -d "$clone/$base" ]] || continue
+
+        if [[ -n "$marker" ]]; then
+          # Recursos tipo directorio (skills): <base>/<name>/<marker>
+          for d in "$clone/$base"/*/; do
+            [[ -d "$d" ]] || continue
+            [[ -f "${d}${marker}" ]] || continue
+            echo "$subdir/$(basename "$d")"
+          done
+        else
+          # Recursos tipo archivo: <base>/*.ext
+          for f in "$clone/$base"/*"$ext"; do
+            [[ -f "$f" ]] || continue
+            echo "$subdir/$(basename "$f")"
+          done
+          # Extensión secundaria (ej. script .md para docs de hooks)
+          if [[ -n "$extra" ]]; then
+            for f in "$clone/$base"/*"$extra"; do
+              [[ -f "$f" ]] || continue
+              echo "$subdir/$(basename "$f")"
+            done
+          fi
+        fi
+      done
+    done
+  } | awk '!seen[$0]++'
+}
+
+# Mapea subdir del perfil → kind (inverso de kind_subdir).
+# Ejemplo: "skills" → "skill", "scripts" → "script"
+_subdir_to_kind() {
+  case "$1" in
+    skills)     echo "skill" ;;
+    agents)     echo "agent" ;;
+    commands)   echo "command" ;;
+    rules)      echo "rule" ;;
+    references) echo "reference" ;;
+    scripts)    echo "script" ;;
+  esac
+}
+
+# Copia un archivo del clone al perfil, respetando la estructura enumerada.
+# Resuelve el source probando KIND_DIRS del tipo correspondiente.
+copy_pack_file() {
+  local clone="$1" profile_dir="$2" rel_path="$3"
+
+  local subdir="${rel_path%%/*}"
+  local fname="${rel_path#*/}"
+  local kind; kind="$(_subdir_to_kind "$subdir")"
+
+  local src="" base
+  if [[ -n "$kind" ]]; then
+    for base in $(kind_dirs "$kind"); do
+      if [[ -e "$clone/$base/$fname" ]]; then
+        src="$clone/$base/$fname"
+        break
+      fi
+    done
+  else
+    [[ -e "$clone/$rel_path" ]] && src="$clone/$rel_path"
+  fi
+
+  if [[ -z "$src" || ! -e "$src" ]]; then
+    log_warn "    no se encontró el fuente para $rel_path (skip)"
+    return 0
+  fi
+
+  local dst="$profile_dir/$rel_path"
+  mkdir -p "$(dirname "$dst")"
+  if [[ -d "$src" ]]; then
+    cp -R "$src" "$dst"
+  else
+    cp "$src" "$dst"
+  fi
+  # Preservar exec en shells
+  if [[ "$rel_path" == *.sh ]]; then
+    chmod +x "$dst"
+  fi
+}
+
+# Devuelve breakdown de contenido de un pack (formato "21 skills · 3 agents · ...")
+pack_content_summary() {
+  local profile="$1" pack_name="$2"
+  local manifest; manifest="$(read_manifest "$profile")"
+  local counts; counts="$(echo "$manifest" | jq -r --arg p "$pack_name" '
+    .[$p].files as $f |
+    [
+      ($f | map(select(startswith("skills/"))) | length),
+      ($f | map(select(startswith("agents/"))) | length),
+      ($f | map(select(startswith("commands/"))) | length),
+      ($f | map(select(startswith("references/"))) | length),
+      ($f | map(select(startswith("rules/"))) | length),
+      ($f | map(select(startswith("scripts/"))) | length)
+    ] | @tsv
+  ')"
+  IFS=$'\t' read -r s a c r rl sc <<< "$counts"
+  local parts=()
+  (( s > 0 )) && parts+=("$s skills")
+  (( a > 0 )) && parts+=("$a agents")
+  (( c > 0 )) && parts+=("$c commands")
+  (( r > 0 )) && parts+=("$r references")
+  (( rl > 0 )) && parts+=("$rl rules")
+  (( sc > 0 )) && parts+=("$sc scripts")
+  if [[ "${#parts[@]}" -eq 0 ]]; then
+    echo "(vacío)"
+  else
+    local out=""
+    local part
+    for part in "${parts[@]}"; do
+      [[ -n "$out" ]] && out+=" · "
+      out+="$part"
+    done
+    echo "$out"
+  fi
+}
+
+# ---------- cmd: pack list ----------
+cmd_pack_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+
+  local manifest; manifest="$(read_manifest "$profile")"
+  local count; count="$(echo "$manifest" | jq 'length')"
+
+  banner "PACKS ▸ $profile" "($count)"
+  if [[ "$count" == "0" ]]; then
+    printf "  %b(ninguno)%b\n\n" "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r key source commit installed; do
+    local short_commit="${commit:0:7}"
+    local content; content="$(pack_content_summary "$profile" "$key")"
+
+    printf "  %b◆%b  %b%s%b\n" "$C_NEON" "$C_RESET" "$C_BOLD" "$key" "$C_RESET"
+    printf "     %bsource%b     %s\n"    "$C_GRAY" "$C_RESET" "$source"
+    printf "     %bcommit%b     %b%s%b  %b(%s)%b\n" \
+      "$C_GRAY" "$C_RESET" "$C_ACID" "$short_commit" "$C_RESET" "$C_DIM" "$commit" "$C_RESET"
+    printf "     %binstalled%b  %s\n"    "$C_GRAY" "$C_RESET" "$installed"
+    printf "     %bcontent%b    %b%s%b\n" "$C_GRAY" "$C_RESET" "$C_ELEC" "$content" "$C_RESET"
+    echo
+  done < <(echo "$manifest" | jq -r '
+    to_entries[] |
+    [.key, .value.source, (.value.commit // "?"), (.value.installed_at // "?")] | @tsv
+  ')
+}
+
+# Parsea flags post-URL de pack install. Respeta prioridad:
+#   --pin <commit>   ganador absoluto (pinned version)
+#   --branch <name>  fija branch
+#   --tag <name>     fija tag (equivalente a branch en git clone --branch)
+# Setea globals: _PACK_REF, _PACK_REF_KIND ("pin"|"branch"|"tag"|"")
+_parse_pack_ref_flags() {
+  _PACK_REF=""
+  _PACK_REF_KIND=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pin)    [[ $# -ge 2 ]] || die "--pin requiere un commit SHA";  _PACK_REF="$2";  _PACK_REF_KIND="pin";    shift 2 ;;
+      --branch) [[ $# -ge 2 ]] || die "--branch requiere un nombre";   _PACK_REF="$2";  _PACK_REF_KIND="branch"; shift 2 ;;
+      --tag)    [[ $# -ge 2 ]] || die "--tag requiere un nombre";      _PACK_REF="$2";  _PACK_REF_KIND="tag";    shift 2 ;;
+      --dry-run) _DRY_RUN=1; shift ;;
+      *) die "flag desconocido: $1" ;;
+    esac
+  done
+}
+
+# Clona un repo para pack operations resolviendo la ref:
+#   1. $_PACK_REF si se pasó (--pin/--branch/--tag)
+#   2. branch en la URL (/tree/<branch>)
+#   3. default branch del repo (HEAD)
+#
+# Setea globals:
+#   _PACK_CLONE_DIR   dir donde quedó clonado (caller borra con rm -rf)
+#   _PACK_COMMIT      commit SHA resultante
+#   _PACK_CLEAN_URL   URL sin /tree/.../ (para manifest.source)
+#   _PACK_REF_USED    referencia efectivamente usada ("" si default HEAD)
+_pack_clone() {
+  local url="$1" target_dir="$2"
+  local parts; parts="$(parse_github_url "$url")"
+  local owner repo url_branch url_path
+  IFS=$'\t' read -r owner repo url_branch url_path <<< "$parts"
+  [[ -n "$owner" && -n "$repo" ]] || die "URL GitHub inválida: $url"
+
+  _PACK_CLEAN_URL="https://github.com/$owner/$repo"
+
+  # Determinar ref a usar
+  local ref="" ref_kind=""
+  if [[ -n "${_PACK_REF:-}" ]]; then
+    ref="$_PACK_REF"
+    ref_kind="$_PACK_REF_KIND"
+  elif [[ -n "$url_branch" ]]; then
+    ref="$url_branch"
+    ref_kind="branch"
+  fi
+  _PACK_REF_USED="$ref"
+
+  local clone_args=()
+  # Con --pin no podemos hacer shallow clone (necesitamos history)
+  if [[ "$ref_kind" == "pin" ]]; then
+    log_info "pin: $ref (clone completo — puede tardar)"
+  else
+    clone_args+=(--depth 1)
+    [[ -n "$ref" ]] && clone_args+=(--branch "$ref")
+  fi
+
+  log_info "Clonando $owner/$repo${ref:+ ($ref_kind: $ref)}..."
+  # timeout no viene por default en macOS; usamos gtimeout si existe, si no clone directo.
+  local tmo=""
+  command -v timeout  >/dev/null 2>&1 && tmo="timeout 120"
+  command -v gtimeout >/dev/null 2>&1 && tmo="gtimeout 120"
+  $tmo git clone "${clone_args[@]}" "$_PACK_CLEAN_URL" "$target_dir" >/dev/null 2>&1 \
+    || die "git clone falló ($_PACK_CLEAN_URL${ref:+ $ref_kind=$ref})"
+
+  if [[ "$ref_kind" == "pin" ]]; then
+    ( cd "$target_dir" && git checkout --quiet "$ref" ) \
+      || die "git checkout del pin '$ref' falló"
+  fi
+
+  _PACK_COMMIT="$(cd "$target_dir" && git rev-parse HEAD)"
+  _PACK_CLONE_DIR="$target_dir"
+}
+
+# Warna al user si el pack trae hooks o MCP servers — corren código.
+# Solo advertencia; no detiene la instalación.
+_warn_dangerous_pack_content() {
+  local clone="$1"
+  local hook_count=0 mcp_count=0 dir
+
+  for dir in "$clone/hooks" "$clone/.claude/scripts" "$clone/scripts"; do
+    [[ -d "$dir" ]] || continue
+    shopt -s nullglob
+    local files=( "$dir"/*.sh )
+    shopt -u nullglob
+    hook_count=$((hook_count + ${#files[@]}))
+  done
+
+  local settings="$clone/settings.json"
+  [[ -f "$clone/.claude/settings.json" ]] && settings="$clone/.claude/settings.json"
+  local has_hooks_in_settings=0
+  if [[ -f "$settings" ]]; then
+    jq -e '.hooks // {} | length > 0' "$settings" >/dev/null 2>&1 && has_hooks_in_settings=1
+  fi
+
+  for dir in "$clone/mcp.json" "$clone/.mcp.json"; do
+    [[ -f "$dir" ]] || continue
+    mcp_count="$(jq -r '(.mcpServers // {}) | length' "$dir" 2>/dev/null || echo 0)"
+  done
+
+  if (( hook_count > 0 || has_hooks_in_settings > 0 || mcp_count > 0 )); then
+    log_warn "⚠ este pack incluye código ejecutable:"
+    (( hook_count > 0 ))           && printf "      - %d hook script(s) (.sh)\n" "$hook_count" >&2
+    (( has_hooks_in_settings > 0 )) && printf "      - hooks configurados en settings.json (se copiarán al aplicar el perfil)\n" >&2
+    (( mcp_count > 0 ))            && printf "      - %d MCP server(s) — con acceso a tu máquina\n" "$mcp_count" >&2
+    log_warn "  revisá el repo antes de usar este pack en un proyecto productivo."
+  fi
+}
+
+# ---------- cmd: pack install ----------
+cmd_pack_install() {
+  local profile="$1" url="$2"; shift 2
+  _DRY_RUN=0
+  _parse_pack_ref_flags "$@"
+
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  local pack_name; pack_name="$(pack_name_from_url "$url")"
+
+  local _tag=""; (( _DRY_RUN )) && _tag=" (DRY-RUN)"
+  log_step "Instalando pack: $pack_name en perfil: $profile$_tag"
+
+  if pack_is_installed "$profile" "$pack_name"; then
+    die "Pack '$pack_name' ya está instalado. Usá 'pack update' o 'pack remove' primero."
+  fi
+
+  require_cmd git
+  require_cmd jq
+
+  local tmp; tmp="$(mktemp -d)"
+  trap "rm -rf '$tmp'" EXIT
+
+  _pack_clone "$url" "$tmp/clone"
+  local commit="$_PACK_COMMIT"
+  local clean_url="$_PACK_CLEAN_URL"
+  local ref_used="$_PACK_REF_USED"
+  local ref_kind="$_PACK_REF_KIND"
+  log_info "Commit: $commit"
+
+  local files=()
+  while IFS= read -r line; do
+    files+=("$line")
+  done < <(enumerate_pack_files "$tmp/clone")
+
+  [[ "${#files[@]}" -eq 0 ]] && die "El pack no contiene archivos reconocibles (skills/, agents/, rules/, references/, commands/, .claude/commands/, hooks/, scripts/)"
+
+  # Warn de hooks/MCPs (seguridad): correrán código arbitrario
+  _warn_dangerous_pack_content "$tmp/clone"
+
+  if (( _DRY_RUN )); then
+    log_info "DRY-RUN: no se escribirá nada. Se copiarían ${#files[@]} items:"
+    for rel in "${files[@]}"; do
+      local dst="$profile_dir/$rel"
+      if [[ -e "$dst" ]]; then
+        printf "    %b~%b %s (ya existe, se saltaría)\n" "$C_DIM" "$C_RESET" "$rel"
+      else
+        printf "    %b+%b %s\n" "$C_OK" "$C_RESET" "$rel"
+      fi
+    done
+    return 0
+  fi
+
+  log_info "Copiando ${#files[@]} archivos/directorios al perfil..."
+  for rel in "${files[@]}"; do
+    local dst="$profile_dir/$rel"
+    if [[ -e "$dst" ]]; then
+      log_warn "    $rel ya existe en el perfil — SKIP (quitalo antes si querés que el pack lo administre)"
+      continue
+    fi
+    copy_pack_file "$tmp/clone" "$profile_dir" "$rel"
+    echo "    + $rel"
+  done
+
+  local now; now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local files_json; files_json="$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)"
+
+  local new_manifest
+  new_manifest="$(read_manifest "$profile" | jq \
+    --arg p "$pack_name" \
+    --arg s "$clean_url" \
+    --arg c "$commit" \
+    --arg t "$now" \
+    --arg rk "$ref_kind" \
+    --arg rv "$ref_used" \
+    --argjson f "$files_json" \
+    '.[$p] = (
+      {source: $s, commit: $c, installed_at: $t, files: $f}
+      + (if $rk != "" and $rv != "" then {ref: {kind: $rk, value: $rv}} else {} end)
+    )')"
+
+  echo "$new_manifest" | write_manifest "$profile"
+
+  log_ok "Pack '$pack_name' instalado en perfil '$profile'"
+  log_info "Re-aplicá en los repos que ya usan ese perfil: apply-ccp --force $profile"
+}
+
+# ---------- cmd: pack update ----------
+# Usage: cmd_pack_update <profile> <pack|--all> [--dry-run]
+cmd_pack_update() {
+  local profile="$1" target="$2"; shift 2
+  _DRY_RUN=0
+  _PACK_REF=""; _PACK_REF_KIND=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) _DRY_RUN=1; shift ;;
+      *) die "flag desconocido: $1" ;;
+    esac
+  done
+  profile_dir_or_fail "$profile" >/dev/null
+
+  # Soporte --all: itera packs del manifest
+  if [[ "$target" == "--all" ]]; then
+    require_cmd jq
+    local names; names="$(read_manifest "$profile" | jq -r 'keys[]')"
+    [[ -z "$names" ]] && { log_warn "perfil '$profile' no tiene packs instalados"; return 0; }
+    local n
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      _pack_update_one "$profile" "$n"
+    done <<< "$names"
+    return 0
+  fi
+
+  _pack_update_one "$profile" "$target"
+}
+
+_pack_update_one() {
+  local profile="$1" pack_name="$2"
+  local profile_dir="$PROFILES_DIR/$profile"
+
+  local _tag=""; (( _DRY_RUN )) && _tag=" (DRY-RUN)"
+  log_step "Actualizando pack: $pack_name en perfil: $profile$_tag"
+
+  pack_is_installed "$profile" "$pack_name" || die "Pack '$pack_name' no está instalado."
+
+  require_cmd git
+  require_cmd jq
+
+  local manifest; manifest="$(read_manifest "$profile")"
+  local url; url="$(echo "$manifest" | jq -r --arg p "$pack_name" '.[$p].source')"
+  local old_commit; old_commit="$(echo "$manifest" | jq -r --arg p "$pack_name" '.[$p].commit')"
+  local old_files; old_files="$(echo "$manifest" | jq -r --arg p "$pack_name" '.[$p].files[]')"
+
+  # Respetar ref del manifest (pin/branch/tag) si está guardada
+  _PACK_REF="$(echo "$manifest"     | jq -r --arg p "$pack_name" '.[$p].ref.value // ""')"
+  _PACK_REF_KIND="$(echo "$manifest"| jq -r --arg p "$pack_name" '.[$p].ref.kind  // ""')"
+
+  log_info "Source: $url${_PACK_REF:+  ($_PACK_REF_KIND: $_PACK_REF)}"
+  log_info "Commit actual: $old_commit"
+
+  local tmp; tmp="$(mktemp -d)"
+  trap "rm -rf '$tmp'" EXIT
+
+  _pack_clone "$url" "$tmp/clone"
+  local new_commit="$_PACK_COMMIT"
+  log_info "Commit nuevo: $new_commit"
+
+  if [[ "$old_commit" == "$new_commit" ]]; then
+    log_ok "Ya estás en la última versión."
+    return 0
+  fi
+
+  local new_files=()
+  while IFS= read -r line; do
+    new_files+=("$line")
+  done < <(enumerate_pack_files "$tmp/clone")
+
+  _warn_dangerous_pack_content "$tmp/clone"
+
+  if (( _DRY_RUN )); then
+    log_info "DRY-RUN: se borrarían $(wc -l <<< "$old_files" | tr -d ' ') items viejos y se copiarían ${#new_files[@]} nuevos."
+    return 0
+  fi
+
+  log_info "Removiendo archivos de la versión anterior..."
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local dst="$profile_dir/$rel"
+    if [[ -e "$dst" ]]; then
+      rm -r "$dst"
+      echo "    - $rel"
+    fi
+  done <<< "$old_files"
+
+  log_info "Copiando ${#new_files[@]} archivos/directorios nuevos..."
+  for rel in "${new_files[@]}"; do
+    copy_pack_file "$tmp/clone" "$profile_dir" "$rel"
+    echo "    + $rel"
+  done
+
+  local now; now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local files_json; files_json="$(printf '%s\n' "${new_files[@]}" | jq -R . | jq -s .)"
+
+  local new_manifest
+  new_manifest="$(read_manifest "$profile" | jq \
+    --arg p "$pack_name" \
+    --arg c "$new_commit" \
+    --arg t "$now" \
+    --argjson f "$files_json" \
+    '.[$p].commit = $c | .[$p].installed_at = $t | .[$p].files = $f')"
+
+  echo "$new_manifest" | write_manifest "$profile"
+
+  log_ok "Pack '$pack_name' actualizado de $old_commit a $new_commit"
+  log_info "Re-aplicá: apply-ccp --force $profile"
+}
+
+# ---------- cmd: pack remove ----------
+cmd_pack_remove() {
+  local profile="$1" pack_name="$2"; shift 2
+  _DRY_RUN=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) _DRY_RUN=1; shift ;;
+      *) die "flag desconocido: $1" ;;
+    esac
+  done
+
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+
+  local _tag=""; (( _DRY_RUN )) && _tag=" (DRY-RUN)"
+  log_step "Removiendo pack: $pack_name del perfil: $profile$_tag"
+
+  pack_is_installed "$profile" "$pack_name" || die "Pack '$pack_name' no está instalado."
+
+  require_cmd jq
+
+  local manifest; manifest="$(read_manifest "$profile")"
+  local files; files="$(echo "$manifest" | jq -r --arg p "$pack_name" '.[$p].files[]')"
+
+  log_info "Archivos a remover:"
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local dst="$profile_dir/$rel"
+    if [[ -e "$dst" ]]; then
+      if (( _DRY_RUN )); then
+        printf "    %b-%b %s\n" "$C_WARN" "$C_RESET" "$rel"
+      else
+        rm -r "$dst"
+        echo "    - $rel"
+      fi
+    else
+      log_warn "    $rel (ya no existía)"
+    fi
+  done <<< "$files"
+
+  if (( _DRY_RUN )); then
+    log_info "DRY-RUN: manifest no se modifica."
+    return 0
+  fi
+
+  local new_manifest; new_manifest="$(echo "$manifest" | jq --arg p "$pack_name" 'del(.[$p])')"
+  echo "$new_manifest" | write_manifest "$profile"
+
+  log_ok "Pack '$pack_name' removido del perfil '$profile'"
+  log_info "Los archivos del pack en repos existentes seguirán ahí hasta que borrés a mano o re-apliques desde cero."
+}
+
+# ---------- cmd: profile create ----------
+cmd_profile_create() {
+  local name="$1"; shift
+  local description="" stack=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --description) [[ $# -ge 2 ]] || die "--description requiere un valor"; description="$2"; shift 2 ;;
+      --stack)       [[ $# -ge 2 ]] || die "--stack requiere un valor (coma-separado)"; stack="$2"; shift 2 ;;
+      *) die "flag desconocido: $1" ;;
+    esac
+  done
+
+  validate_resource_name "$name" || exit 1
+  local dir="$PROFILES_DIR/$name"
+  [[ -e "$dir" ]] && die "Perfil '$name' ya existe: $dir"
+
+  require_cmd jq
+
+  mkdir -p "$dir"
+
+  # profile.json con stack como array
+  local stack_json="[]"
+  if [[ -n "$stack" ]]; then
+    stack_json="$(printf '%s\n' $(echo "$stack" | tr ',' ' ') | jq -R . | jq -s .)"
+  fi
+  jq -n \
+    --arg n "$name" \
+    --arg d "$description" \
+    --argjson s "$stack_json" \
+    '{name: $n, description: $d, stack: $s}' > "$dir/profile.json"
+
+  log_ok "Perfil '$name' creado en $dir"
+  log_info "próximos pasos:"
+  printf "    %b▸%b  editá %b%s/profile.json%b si cambia la descripción/stack\n" "$C_ACID" "$C_RESET" "$C_BOLD" "$dir" "$C_RESET"
+  printf "    %b▸%b  agregá recursos: %bccp skill add %s <nombre>%b\n" "$C_ACID" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  printf "    %b▸%b  instalá packs:   %bccp pack install %s <url>%b\n" "$C_ACID" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  printf "    %b▸%b  aplicalo:        %bcd <repo> && apply-ccp %s%b\n" "$C_ACID" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+}
+
+# ---------- cmd: pack adopt ----------
+cmd_pack_adopt() {
+  local profile="$1" url="$2"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  local pack_name; pack_name="$(pack_name_from_url "$url")"
+
+  log_step "Adoptando pack existente: $pack_name en perfil: $profile"
+
+  pack_is_installed "$profile" "$pack_name" && die "Pack '$pack_name' ya está en el manifest. Usá 'pack update'."
+
+  require_cmd git
+  require_cmd jq
+
+  local tmp; tmp="$(mktemp -d)"
+  trap "rm -rf '$tmp'" EXIT
+
+  _PACK_REF=""; _PACK_REF_KIND=""
+  _pack_clone "$url" "$tmp/clone"
+  local commit="$_PACK_COMMIT"
+  local clean_url="$_PACK_CLEAN_URL"
+  log_info "Commit: $commit"
+
+  # Enumerar archivos que el pack aportaría
+  local candidate_files=()
+  while IFS= read -r line; do
+    candidate_files+=("$line")
+  done < <(enumerate_pack_files "$tmp/clone")
+
+  # Filtrar: solo los que YA existen en el perfil
+  local adopted=()
+  for rel in "${candidate_files[@]}"; do
+    if [[ -e "$profile_dir/$rel" ]]; then
+      adopted+=("$rel")
+    fi
+  done
+
+  [[ "${#adopted[@]}" -eq 0 ]] && die "No se encontró ningún archivo del pack en el perfil. ¿Seguro que está instalado?"
+
+  log_info "Archivos del pack detectados en el perfil: ${#adopted[@]}"
+  for rel in "${adopted[@]}"; do
+    echo "    • $rel"
+  done
+
+  local now; now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local files_json; files_json="$(printf '%s\n' "${adopted[@]}" | jq -R . | jq -s .)"
+  local new_manifest
+  new_manifest="$(read_manifest "$profile" | jq \
+    --arg p "$pack_name" \
+    --arg s "$clean_url" \
+    --arg c "$commit" \
+    --arg t "$now" \
+    --argjson f "$files_json" \
+    '.[$p] = {source: $s, commit: $c, installed_at: $t, files: $f, adopted: true}')"
+
+  echo "$new_manifest" | write_manifest "$profile"
+
+  log_ok "Pack '$pack_name' adoptado. El manifest ahora trackea ${#adopted[@]} archivos."
+  log_info "A partir de ahora podés usar 'pack update' y 'pack remove' normalmente."
+}
+
+# ---------- Counting helpers (siempre devuelven un solo entero) ----------
+count_files_ext() {
+  local dir="$1" ext="$2"
+  [[ -d "$dir" ]] || { echo 0; return; }
+  local n=0
+  shopt -s nullglob
+  local f
+  for f in "$dir"/*"$ext"; do
+    [[ -f "$f" ]] && n=$((n + 1))
+  done
+  shopt -u nullglob
+  echo "$n"
+}
+
+count_dirs() {
+  local dir="$1"
+  [[ -d "$dir" ]] || { echo 0; return; }
+  local n=0
+  shopt -s nullglob
+  local d
+  for d in "$dir"/*/; do
+    [[ -d "$d" ]] && n=$((n + 1))
+  done
+  shopt -u nullglob
+  echo "$n"
+}
+
+count_files_any() {
+  local dir="$1"
+  [[ -d "$dir" ]] || { echo 0; return; }
+  local n=0
+  shopt -s nullglob
+  local f
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] && n=$((n + 1))
+  done
+  shopt -u nullglob
+  echo "$n"
+}
+
+# ---------- Helpers de listing ----------
+
+# Extrae "description" del frontmatter YAML de un .md
+# $1: archivo
+extract_description() {
+  [[ -f "$1" ]] || { echo ""; return; }
+  awk '
+    BEGIN { in_fm = 0 }
+    NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; next }
+    in_fm && /^---[[:space:]]*$/ { exit }
+    in_fm && /^description:/ {
+      sub(/^description:[[:space:]]*/, "")
+      gsub(/^["'\''`]/, "")
+      gsub(/["'\''`][[:space:]]*$/, "")
+      print
+      exit
+    }
+  ' "$1"
+}
+
+# Busca a qué pack pertenece un archivo del perfil (según manifest)
+# $1: profile, $2: ruta relativa (ej. "skills/foo" o "agents/bar.md")
+# stdout: nombre del pack o vacío
+file_pack_origin() {
+  local profile="$1" rel="$2"
+  local manifest; manifest="$(read_manifest "$profile")"
+  echo "$manifest" | jq -r --arg f "$rel" '
+    [to_entries[] | select(.value.files | index($f)) | .key] | .[0] // ""
+  '
+}
+
+# Trunca un string a N chars (para alinear output)
+trunc() {
+  local s="$1" n="$2"
+  if (( ${#s} > n )); then
+    echo "${s:0:n-1}…"
+  else
+    echo "$s"
+  fi
+}
+
+# ---------- Listers por tipo ----------
+
+# Lista directorios (para skills) con description desde <dir>/SKILL.md
+list_dirs_impl() {
+  local profile="$1" subdir="$2" inner_file="$3"
+  local dir="$PROFILES_DIR/$profile/$subdir"
+  [[ -d "$dir" ]] || return 0
+  for d in "$dir"/*/; do
+    [[ -d "$d" ]] || continue
+    local name; name="$(basename "$d")"
+    local desc=""
+    [[ -f "$d/$inner_file" ]] && desc="$(extract_description "$d/$inner_file")"
+    local origin; origin="$(file_pack_origin "$profile" "$subdir/$name")"
+    printf "%s\t%s\t%s\n" "$name" "$desc" "$origin"
+  done
+}
+
+# Lista archivos .md con description
+list_files_md_impl() {
+  local profile="$1" subdir="$2"
+  local dir="$PROFILES_DIR/$profile/$subdir"
+  [[ -d "$dir" ]] || return 0
+  for f in "$dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    local name; name="$(basename "$f")"
+    local desc; desc="$(extract_description "$f")"
+    local origin; origin="$(file_pack_origin "$profile" "$subdir/$name")"
+    printf "%s\t%s\t%s\n" "${name%.md}" "$desc" "$origin"
+  done
+}
+
+# Lista archivos en scripts/ (mezcla .sh, .md, etc.)
+list_files_all_impl() {
+  local profile="$1" subdir="$2"
+  local dir="$PROFILES_DIR/$profile/$subdir"
+  [[ -d "$dir" ]] || return 0
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    local name; name="$(basename "$f")"
+    local origin; origin="$(file_pack_origin "$profile" "$subdir/$name")"
+    printf "%s\t%s\t%s\n" "$name" "" "$origin"
+  done
+}
+
+# Lista MCPs desde mcp.json del perfil
+list_mcps_impl() {
+  local profile="$1"
+  local file="$PROFILES_DIR/$profile/mcp.json"
+  [[ -f "$file" ]] || return 0
+  jq -r '
+    .mcpServers // {} | to_entries[] |
+    [.key, ((.value.command // "") + " " + ((.value.args // []) | join(" "))), ""] | @tsv
+  ' "$file" 2>/dev/null
+}
+
+# Formatea una tabla con columnas (name \t desc \t origin)
+# Cada item se imprime con wrap y separación visual.
+print_table() {
+  local items; items="$(cat)"
+  if [[ -z "$items" ]]; then
+    printf "  %b(ninguno)%b\n\n" "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  # Agrupar por origen
+  local pack_items="" manual_items=""
+  while IFS=$'\t' read -r name desc origin; do
+    if [[ -n "$origin" ]]; then
+      pack_items+="${origin}|${name}|${desc}"$'\n'
+    else
+      manual_items+="${name}|${desc}"$'\n'
+    fi
+  done <<< "$items"
+
+  # Imprimir grupos pack
+  if [[ -n "$pack_items" ]]; then
+    local packs; packs="$(echo -n "$pack_items" | awk -F '|' '{print $1}' | sort -u)"
+    while IFS= read -r pack; do
+      [[ -z "$pack" ]] && continue
+      local pack_count; pack_count="$(echo -n "$pack_items" | awk -F '|' -v p="$pack" '$1 == p' | wc -l | tr -d ' ')"
+      subhead "pack: $pack" "($pack_count)"
+      while IFS='|' read -r _ name desc; do
+        [[ -z "$name" ]] && continue
+        item "$name" "$desc"
+      done < <(echo -n "$pack_items" | awk -F '|' -v p="$pack" '$1 == p')
+      echo
+    done <<< "$packs"
+  fi
+
+  # Imprimir grupo manual
+  if [[ -n "$manual_items" ]]; then
+    local m_count; m_count="$(echo -n "$manual_items" | wc -l | tr -d ' ')"
+    subhead "manual" "($m_count)"
+    while IFS='|' read -r name desc; do
+      [[ -z "$name" ]] && continue
+      item "$name" "$desc"
+    done <<< "$manual_items"
+    echo
+  fi
+}
+
+# ---------- cmd: X list ----------
+
+cmd_skill_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local count; count="$(count_dirs "$PROFILES_DIR/$profile/skills")"
+  banner "SKILLS ▸ $profile" "($count)"
+  list_dirs_impl "$profile" "skills" "SKILL.md" | print_table
+}
+
+cmd_agent_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local count; count="$(count_files_ext "$PROFILES_DIR/$profile/agents" ".md")"
+  banner "AGENTS ▸ $profile" "($count)"
+  list_files_md_impl "$profile" "agents" | print_table
+}
+
+cmd_command_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local count; count="$(count_files_ext "$PROFILES_DIR/$profile/commands" ".md")"
+  banner "COMMANDS ▸ $profile" "($count)"
+  list_files_md_impl "$profile" "commands" | print_table
+}
+
+cmd_reference_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local count; count="$(count_files_ext "$PROFILES_DIR/$profile/references" ".md")"
+  banner "REFERENCES ▸ $profile" "($count)"
+  list_files_md_impl "$profile" "references" | print_table
+}
+
+cmd_rule_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local count; count="$(count_files_ext "$PROFILES_DIR/$profile/rules" ".md")"
+  banner "RULES ▸ $profile" "($count)"
+  list_files_md_impl "$profile" "rules" | print_table
+}
+
+cmd_script_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local count; count="$(count_files_any "$PROFILES_DIR/$profile/scripts")"
+  banner "SCRIPTS ▸ $profile" "($count)"
+  list_files_all_impl "$profile" "scripts" | print_table
+}
+
+cmd_mcp_list() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+  local mcp_file="$PROFILES_DIR/$profile/mcp.json"
+  if [[ ! -f "$mcp_file" ]]; then
+    banner "MCPs ▸ $profile" "(0)"
+    printf "  %b(el perfil no tiene mcp.json)%b\n\n" "$C_DIM" "$C_RESET"
+    return 0
+  fi
+  local count; count="$(jq '.mcpServers // {} | length' "$mcp_file" 2>/dev/null || echo 0)"
+  banner "MCPs ▸ $profile" "($count)"
+  list_mcps_impl "$profile" | print_table
+}
+
+# ---------- cmd: inventory ----------
+# Renderiza barra de progreso visual (▰▱) para una métrica
+render_bar() {
+  local value="$1" max="${2:-25}"
+  local bar=""
+  local i
+  for ((i=0; i<value && i<max; i++)); do bar+="▰"; done
+  (( value == 0 )) && bar="·"
+  printf "%b%s%b" "$C_ACID" "$bar" "$C_RESET"
+}
+
+# Renderiza una fila de resource en inventory
+inv_row() {
+  local label="$1" count="$2" breakdown="${3:-}"
+  printf "  %b%-11s%b  %b%3d%b  %s  " \
+    "$C_INFO" "$label" "$C_RESET" \
+    "$C_GOLD" "$count" "$C_RESET" \
+    "$(render_bar "$count")"
+  if [[ -n "$breakdown" ]]; then
+    printf "%b%s%b" "$C_GRAY" "$breakdown" "$C_RESET"
+  fi
+  echo
+}
+
+cmd_inventory() {
+  local profile="$1"
+  profile_dir_or_fail "$profile" >/dev/null
+
+  local pdir="$PROFILES_DIR/$profile"
+
+  # Counts
+  local n_skills;     n_skills="$(count_dirs "$pdir/skills")"
+  local n_agents;     n_agents="$(count_files_ext "$pdir/agents" ".md")"
+  local n_commands;   n_commands="$(count_files_ext "$pdir/commands" ".md")"
+  local n_references; n_references="$(count_files_ext "$pdir/references" ".md")"
+  local n_rules;      n_rules="$(count_files_ext "$pdir/rules" ".md")"
+  local n_scripts;    n_scripts="$(count_files_any "$pdir/scripts")"
+  local n_mcps=0
+  if [[ -f "$pdir/mcp.json" ]]; then
+    n_mcps="$(jq '.mcpServers // {} | length' "$pdir/mcp.json" 2>/dev/null || echo 0)"
+  fi
+
+  count_pack_manual() {
+    local subdir="$1" total="$2"
+    local manifest; manifest="$(read_manifest "$profile")"
+    local pc; pc="$(echo "$manifest" | jq --arg s "$subdir" \
+      '[to_entries[] | .value.files[] | select(startswith($s + "/"))] | length')"
+    local manual=$((total - pc))
+    if (( pc > 0 && manual > 0 ));   then echo "$pc pack · $manual manual"
+    elif (( pc > 0 ));                then echo "$pc pack"
+    elif (( manual > 0 ));            then echo "$manual manual"
+    else                                   echo ""
+    fi
+  }
+
+  banner "INVENTORY ▸ $profile"
+
+  inv_row "SKILLS"     "$n_skills"     "$(count_pack_manual skills "$n_skills")"
+  inv_row "AGENTS"     "$n_agents"     "$(count_pack_manual agents "$n_agents")"
+  inv_row "COMMANDS"   "$n_commands"   "$(count_pack_manual commands "$n_commands")"
+  inv_row "REFERENCES" "$n_references" "$(count_pack_manual references "$n_references")"
+  inv_row "RULES"      "$n_rules"      "$(count_pack_manual rules "$n_rules")"
+  inv_row "SCRIPTS"    "$n_scripts"    "$(count_pack_manual scripts "$n_scripts")"
+  inv_row "MCPs"       "$n_mcps"       ""
+
+  local manifest; manifest="$(read_manifest "$profile")"
+  local pack_count; pack_count="$(echo "$manifest" | jq 'length')"
+  inv_row "PACKS"      "$pack_count"   ""
+
+  if [[ "$pack_count" -gt 0 ]]; then
+    echo
+    while IFS=$'\t' read -r name commit; do
+      local short="${commit:0:7}"
+      local content; content="$(pack_content_summary "$profile" "$name")"
+      printf "    %b◆%b  %b%s%b  %b%s%b\n" \
+        "$C_NEON" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "$C_ACID" "$short" "$C_RESET"
+      printf "       %b%s%b\n" "$C_GRAY" "$content" "$C_RESET"
+    done < <(echo "$manifest" | jq -r 'to_entries[] | [.key, .value.commit] | @tsv')
+  fi
+
+  local total=$((n_skills + n_agents + n_commands + n_references + n_rules + n_scripts))
+  echo
+  hr "─" "$C_DARK"
+  printf "  %bTOTAL ▸%b  %b%d%b archivos  ·  %b%d%b MCPs  ·  %b%d%b packs\n" \
+    "$C_BOLD" "$C_RESET" \
+    "$C_GOLD" "$total" "$C_RESET" \
+    "$C_GOLD" "$n_mcps" "$C_RESET" \
+    "$C_GOLD" "$pack_count" "$C_RESET"
+  hr "─" "$C_DARK"
+  echo
+}
+
+# ---------- GitHub fetch helpers ----------
+
+# Parsea una URL de GitHub.
+# stdout: <owner>\t<repo>\t<branch>\t<path>  (branch y path pueden ser vacíos)
+# Soporta:
+#   https://github.com/owner/repo
+#   https://github.com/owner/repo.git
+#   https://github.com/owner/repo/tree/<branch>/<path>
+#   https://github.com/owner/repo/blob/<branch>/<path>
+parse_github_url() {
+  local url="$1"
+  url="${url%/}"
+  url="${url%.git}"
+  local rest="${url#https://github.com/}"
+  rest="${rest#http://github.com/}"
+  rest="${rest#git@github.com:}"
+
+  local owner repo branch="" path=""
+  owner="${rest%%/*}"
+  rest="${rest#"$owner"}"
+  rest="${rest#/}"
+
+  if [[ -z "$rest" ]]; then
+    printf "%s\t\t\t\n" "$owner"
+    return 0
+  fi
+
+  repo="${rest%%/*}"
+  rest="${rest#"$repo"}"
+  rest="${rest#/}"
+
+  if [[ -z "$rest" ]]; then
+    printf "%s\t%s\t\t\n" "$owner" "$repo"
+    return 0
+  fi
+
+  local kind_token="${rest%%/*}"
+  rest="${rest#"$kind_token"}"
+  rest="${rest#/}"
+
+  if [[ "$kind_token" != "tree" && "$kind_token" != "blob" ]]; then
+    # URL rara pero igual devolvemos lo que tenemos
+    printf "%s\t%s\t\t\n" "$owner" "$repo"
+    return 0
+  fi
+
+  if [[ -z "$rest" ]]; then
+    printf "%s\t%s\t\t\n" "$owner" "$repo"
+    return 0
+  fi
+
+  branch="${rest%%/*}"
+  rest="${rest#"$branch"}"
+  rest="${rest#/}"
+  path="$rest"
+
+  printf "%s\t%s\t%s\t%s\n" "$owner" "$repo" "$branch" "$path"
+}
+
+# Clona un repo GitHub (shallow) y guarda el dir en $GH_CLONE_DIR y el commit en $GH_COMMIT.
+# El caller DEBE hacer rm -r del clone dir al terminar.
+# $1: owner, $2: repo, $3: branch (puede ser vacío)
+github_clone() {
+  local owner="$1" repo="$2" branch="${3:-}"
+  require_cmd git
+
+  local tmp; tmp="$(mktemp -d)"
+  GH_CLONE_DIR="$tmp"
+
+  local url="https://github.com/$owner/$repo"
+  log_info "clonando $owner/$repo${branch:+ ($branch)}..."
+
+  local clone_args=(--depth 1)
+  [[ -n "$branch" ]] && clone_args+=(--branch "$branch")
+
+  if ! git clone "${clone_args[@]}" "$url" "$tmp/clone" >/dev/null 2>&1; then
+    log_err "git clone falló ($url${branch:+ branch=$branch})"
+    rm -r "$tmp" 2>/dev/null || true
+    return 1
+  fi
+
+  GH_COMMIT="$(cd "$tmp/clone" && git rev-parse HEAD)"
+  return 0
+}
+
+# Localiza el recurso dentro de un directorio base (clone o path local).
+# Setea GH_SRC al path si lo encuentra. Return 1 si no.
+# $1: kind, $2: name, $3: url_path (puede ser vacío), $4: base_dir (opcional — default $GH_CLONE_DIR/clone)
+github_locate() {
+  local kind="$1" name="$2" url_path="${3:-}"
+  local clone="${4:-$GH_CLONE_DIR/clone}"
+  GH_SRC=""
+
+  if [[ -n "$url_path" ]]; then
+    local candidate="$clone/$url_path"
+    if [[ -e "$candidate" ]]; then
+      GH_SRC="$candidate"
+      return 0
+    fi
+    log_err "path no existe en el repo: $url_path"
+    return 1
+  fi
+
+  local marker; marker="$(kind_marker "$kind")"
+  local ext; ext="$(kind_ext "$kind")"
+  local -a dirs=()
+  local d
+  for d in $(kind_dirs "$kind"); do dirs+=("$d"); done
+  (( ${#dirs[@]} > 0 )) || { log_err "kind inválido: $kind"; return 1; }
+
+  # Skill-like (recurso tipo directorio con marker): skill
+  if [[ -n "$marker" ]]; then
+    local cand
+    for cand in "${dirs[@]}" ""; do
+      local base="${cand:+$cand/}$name"
+      if [[ -d "$clone/$base" && -f "$clone/$base/$marker" ]]; then
+        GH_SRC="$clone/$base"
+        return 0
+      fi
+    done
+
+    # Mono-repo: marker en raíz
+    if [[ -f "$clone/$marker" ]]; then
+      GH_SRC="$clone"
+      log_warn "$kind en raíz del repo — copiando repo entero"
+      return 0
+    fi
+
+    # Fallback recursivo: marker cuyo dir padre matche $name
+    local -a all=()
+    while IFS= read -r -d '' f; do
+      all+=("$f")
+    done < <(find "$clone" -type f -name "$marker" -not -path '*/.git/*' -print0 2>/dev/null)
+
+    # Patrón bash 3.2-safe para iterar array posiblemente vacío con set -u
+    local sf parent
+    if (( ${#all[@]} > 0 )); then
+      for sf in "${all[@]}"; do
+        parent="$(basename "$(dirname "$sf")")"
+        if [[ "$parent" == "$name" ]]; then
+          GH_SRC="$(dirname "$sf")"
+          return 0
+        fi
+      done
+    fi
+
+    log_err "no encontré $kind '$name' en el repo"
+    if (( ${#all[@]} > 0 )); then
+      log_info "${kind}s detectados en el repo (${#all[@]}):"
+      for sf in "${all[@]}"; do
+        local rel="${sf#$clone/}"
+        parent="$(basename "$(dirname "$sf")")"
+        printf "    ▸ %s  (path: %s)\n" "$parent" "$(dirname "$rel")" >&2
+      done
+      log_info "tip: usá --from con URL al folder exacto del $kind"
+    else
+      log_info "el directorio no tiene ningún $marker — ¿es realmente un $kind repo?"
+    fi
+    return 1
+  fi
+
+  # Recurso tipo archivo: probar dirs estándar
+  local c
+  for d in "${dirs[@]}"; do
+    c="$clone/$d/$name$ext"
+    if [[ -f "$c" ]]; then GH_SRC="$c"; return 0; fi
+  done
+
+  # Fallback recursivo acotado por $name.$ext
+  local -a matches=()
+  while IFS= read -r -d '' f; do
+    matches+=("$f")
+  done < <(find "$clone" -type f -name "$name$ext" -not -path '*/.git/*' -print0 2>/dev/null)
+
+  if (( ${#matches[@]} == 1 )); then
+    GH_SRC="${matches[0]}"
+    return 0
+  elif (( ${#matches[@]} > 1 )); then
+    log_err "múltiples matches para '$name' (kind=$kind) en el repo:"
+    local m
+    for m in "${matches[@]}"; do
+      printf "    ▸ %s\n" "${m#$clone/}" >&2
+    done
+    log_info "tip: usá --from con URL directa al archivo exacto"
+    return 1
+  fi
+
+  log_err "no encontré '$name' (kind=$kind) en el repo; probá con URL directa al archivo/folder"
+  return 1
+}
+
+# Detecta posible tipo a partir del path URL. Ejemplo:
+#   "agents/foo.md"        → "agent"
+#   "skills/bar"           → "skill"
+#   "commands/x.md"        → "command"
+# Devuelve "" si no matchea ninguna convención.
+detect_kind_from_path() {
+  local p="$1"
+  case "$p" in
+    */skills/*|skills/*)         echo "skill" ;;
+    */agents/*|agents/*)         echo "agent" ;;
+    */commands/*|commands/*)     echo "command" ;;
+    */rules/*|rules/*)           echo "rule" ;;
+    */references/*|references/*) echo "reference" ;;
+    */scripts/*|scripts/*|*/hooks/*|hooks/*) echo "script" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Detecta si un source es URL de GitHub/git o path local.
+_is_github_source() {
+  case "$1" in
+    http://*|https://*|git@*|github.com/*|ssh://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Fetch desde path local: archivo directo o directorio.
+# Setea globals: GH_SRC, GH_COMMIT="local", GH_CLONE_DIR="" (no hay cleanup).
+# $1: kind, $2: name, $3: path local
+_fetch_from_local() {
+  local kind="$1" name="$2" path="$3"
+  GH_SRC=""; GH_COMMIT=""; GH_CLONE_DIR=""
+
+  # Resolver a absoluto si es relativo
+  [[ "${path:0:1}" != "/" ]] && path="$(pwd)/$path"
+  path="${path%/}"
+
+  [[ -e "$path" ]] || { log_err "path local no existe: $path"; return 1; }
+
+  log_info "usando source local: $path"
+
+  # Cross-type detection por path
+  local detected; detected="$(detect_kind_from_path "$path")"
+  if [[ -n "$detected" && "$detected" != "$kind" ]]; then
+    log_warn "el path apunta a /$detected/ pero estás haciendo '$kind add'."
+    log_info "quizás quisiste: ccp $detected add <profile> $name --from $path"
+  fi
+
+  local marker; marker="$(kind_marker "$kind")"
+
+  # Caso 1: archivo directo (rule/agent/command/ref/script)
+  if [[ -f "$path" ]]; then
+    if [[ -n "$marker" ]]; then
+      log_err "$kind requiere un directorio con $marker, no un archivo: $path"
+      return 1
+    fi
+    GH_SRC="$path"
+    GH_COMMIT="local"
+    return 0
+  fi
+
+  # Caso 2: dir directo que ES el skill (tiene marker)
+  if [[ -n "$marker" && -f "$path/$marker" ]]; then
+    GH_SRC="$path"
+    GH_COMMIT="local"
+    return 0
+  fi
+
+  # Caso 3: dir que contiene el recurso (delega a github_locate con base_dir)
+  github_locate "$kind" "$name" "" "$path" || return 1
+  GH_COMMIT="local"
+  return 0
+}
+
+# Orquestador: desde URL GitHub o path local.
+# Setea globals: GH_CLONE_DIR, GH_COMMIT, GH_SRC.
+# Return 0 si OK, 1 si falló.
+# Caller responsable de llamar github_cleanup (no-op si local).
+fetch_from_github() {
+  local kind="$1" name="$2" src="$3"
+
+  # Detección: path local vs URL github
+  if ! _is_github_source "$src"; then
+    _fetch_from_local "$kind" "$name" "$src"
+    return $?
+  fi
+
+  local parts; parts="$(parse_github_url "$src")"
+  local owner repo branch url_path
+  IFS=$'\t' read -r owner repo branch url_path <<< "$parts"
+
+  [[ -n "$owner" && -n "$repo" ]] || { log_err "URL GitHub inválida: $src"; return 1; }
+
+  # Cross-type detection: si URL path sugiere otro tipo, warn antes de clonar.
+  if [[ -n "$url_path" ]]; then
+    local detected; detected="$(detect_kind_from_path "$url_path")"
+    if [[ -n "$detected" && "$detected" != "$kind" ]]; then
+      log_warn "la URL apunta a /$detected/ pero estás haciendo '$kind add'."
+      log_info "quizás quisiste: ccp $detected add <profile> $name --from $src"
+    fi
+  fi
+
+  github_clone "$owner" "$repo" "$branch" || return 1
+  github_locate "$kind" "$name" "$url_path" || return 1
+  return 0
+}
+
+# Valida que un archivo md tenga el frontmatter mínimo esperado para el tipo.
+# Emite warnings (no errores duros) — el archivo igual se copia.
+# $1: type (skill|agent|command|rule|reference)
+# $2: path al archivo .md o dir con SKILL.md
+validate_frontmatter() {
+  local type_name="$1" path="$2"
+  local file="$path"
+  [[ -d "$path" ]] && file="$path/SKILL.md"
+  [[ -f "$file" ]] || return 0
+
+  # Leer hasta el segundo "---" (frontmatter cerrado)
+  local fm
+  fm="$(awk 'NR==1 && /^---$/ {inside=1; next} inside && /^---$/ {exit} inside' "$file")"
+
+  local required=()
+  case "$type_name" in
+    skill)     required=("name" "description") ;;
+    agent)     required=("name" "description") ;;
+    command)   required=("description") ;;
+    rule|reference) return 0 ;;  # Sin frontmatter estricto
+  esac
+
+  local key missing=()
+  for key in "${required[@]}"; do
+    grep -q "^${key}:" <<< "$fm" || missing+=("$key")
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    log_warn "frontmatter incompleto (${type_name}): falta $(IFS=,; echo "${missing[*]}")"
+    log_info "Claude Code puede ignorar este recurso silenciosamente — editá el frontmatter"
+  fi
+}
+
+# Cleanup del clone en BACKGROUND — no bloquea el retorno del script.
+# El rm puede tardar segundos (o más) en discos lentos o con .git grandes.
+# macOS auto-limpia /var/folders con el tiempo si algo falla.
+github_cleanup() {
+  if [[ -n "${GH_CLONE_DIR:-}" && -d "$GH_CLONE_DIR" ]]; then
+    # Doble subshell + & = detached background. El padre retorna ya.
+    ( rm -rf "$GH_CLONE_DIR" >/dev/null 2>&1 & ) 2>/dev/null
+  fi
+  GH_CLONE_DIR=""
+  GH_COMMIT=""
+  GH_SRC=""
+}
+
+# ---------- Helpers CRUD ----------
+
+validate_resource_name() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    log_err "Nombre vacío"
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_.-]*$ ]]; then
+    log_err "Nombre inválido '$name'. Usá lowercase + [a-z0-9_.-]."
+    return 1
+  fi
+  return 0
+}
+
+# Alias hacia el accessor canónico (mantiene callers antiguos).
+subdir_for_type() { kind_subdir "$1"; }
+
+# Parsea args posteriores a <profile> <name>. Extrae --from <src>.
+# Setea variable global _FROM_URL (vacía si no se pasó).
+# --from acepta URL de GitHub o path local (archivo o directorio).
+_parse_add_extras() {
+  _FROM_URL=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ $# -ge 2 ]] || die "--from requiere una URL o path local"
+        _FROM_URL="$2"; shift 2 ;;
+      *) die "arg desconocido: $1" ;;
+    esac
+  done
+}
+
+# Flow unificado de install desde GitHub URL.
+# $1: type, $2: profile, $3: name, $4: url, $5: dst_path
+# Tipo dir (skill): copia -R. Tipo archivo: copia. Valida frontmatter.
+_install_from_url() {
+  local type_name="$1" profile="$2" name="$3" url="$4" dst="$5"
+
+  fetch_from_github "$type_name" "$name" "$url" || die_gh ""
+
+  local marker; marker="$(kind_marker "$type_name")"
+  local is_dir=0
+  [[ -n "$marker" ]] && is_dir=1
+
+  # "local" se muestra tal cual; commit real → primeros 7 chars
+  local origin_label="${GH_COMMIT:0:7}"
+  [[ "$GH_COMMIT" == "local" ]] && origin_label="local"
+  local origin_key="commit"
+  [[ "$GH_COMMIT" == "local" ]] && origin_key="source"
+
+  if (( is_dir )); then
+    [[ -f "$GH_SRC/$marker" ]] || die_gh "el directorio fuente no tiene $marker"
+    mkdir -p "$(dirname "$dst")"
+    log_info "copiando estructura completa..."
+    cp -R "$GH_SRC" "$dst"
+    local n_files; n_files="$(find "$dst" -type f | wc -l | tr -d ' ')"
+    local n_dirs;  n_dirs="$(find "$dst" -mindepth 1 -type d | wc -l | tr -d ' ')"
+    log_ok "$(echo "$type_name" | awk '{print toupper(substr($0,1,1)) substr($0,2)}') '$name' copiado"
+    log_info "archivos: $n_files  ·  subdirs: $n_dirs  ·  $origin_key: $origin_label"
+  else
+    [[ -f "$GH_SRC" ]] || die_gh "el source no es un archivo: $GH_SRC"
+    mkdir -p "$(dirname "$dst")"
+    cp "$GH_SRC" "$dst"
+    if [[ "$type_name" == "script" && "$dst" == *.sh ]]; then
+      chmod +x "$dst"
+    fi
+    local size; size="$(wc -c < "$dst" | tr -d ' ')"
+    log_ok "$(echo "$type_name" | awk '{print toupper(substr($0,1,1)) substr($0,2)}') '$name' copiado"
+    log_info "bytes: $size  ·  $origin_key: $origin_label"
+  fi
+
+  validate_frontmatter "$type_name" "$dst"
+
+  github_cleanup
+  hr "─" "$C_DARK"
+}
+
+# ---------- cmd: skill add/remove ----------
+cmd_skill_add() {
+  local profile="$1" name="$2"; shift 2
+  _parse_add_extras "$@"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  validate_resource_name "$name" || exit 1
+
+  local dir="$profile_dir/skills/$name"
+  if [[ -e "$dir" ]]; then
+    local origin; origin="$(file_pack_origin "$profile" "skills/$name")"
+    if [[ -n "$origin" ]]; then
+      die "Skill '$name' ya existe y pertenece al pack '$origin'"
+    else
+      die "Skill '$name' ya existe en el perfil"
+    fi
+  fi
+
+  if [[ -n "$_FROM_URL" ]]; then
+    _install_from_url "skill" "$profile" "$name" "$_FROM_URL" "$dir"
+    return 0
+  fi
+
+  mkdir -p "$dir"
+  cat > "$dir/SKILL.md" <<EOF
+---
+name: $name
+description: TODO — describe what this does and when Claude should invoke it
+---
+
+TODO — skill instructions (write in English for consistency with Claude Code conventions).
+EOF
+  log_ok "Skill '$name' creado: $dir/SKILL.md"
+  log_info "Editá el archivo para completar description + instrucciones (en inglés)."
+}
+
+cmd_skill_remove() {
+  local profile="$1" name="$2"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  local dir="$profile_dir/skills/$name"
+
+  if [[ ! -e "$dir" ]]; then
+    log_err "Skill '$name' no existe en el perfil '$profile'"
+    exit 1
+  fi
+
+  local origin; origin="$(file_pack_origin "$profile" "skills/$name")"
+  if [[ -n "$origin" ]]; then
+    log_err "Skill '$name' pertenece al pack '$origin'. Usá: ccp pack remove $profile $origin"
+    exit 1
+  fi
+
+  rm -r "$dir"
+  log_ok "Skill '$name' removido"
+}
+
+# ---------- Helpers genéricos para tipos basados en .md ----------
+# Valida + chequea conflict + construye path.
+# Setea variables globales: _MD_FILE (path destino), _MD_SUBDIR
+# return 0 si todo OK para proceder, 1 si falló
+_md_prepare() {
+  local type_name="$1" profile="$2" name="$3"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  validate_resource_name "$name" || return 1
+
+  local subdir; subdir="$(subdir_for_type "$type_name")"
+  local file="$profile_dir/$subdir/$name.md"
+
+  if [[ -e "$file" ]]; then
+    local origin; origin="$(file_pack_origin "$profile" "$subdir/$name.md")"
+    if [[ -n "$origin" ]]; then
+      log_err "$type_name '$name' ya existe y pertenece al pack '$origin'"
+    else
+      log_err "$type_name '$name' ya existe en el perfil"
+    fi
+    return 1
+  fi
+
+  _MD_SUBDIR="$profile_dir/$subdir"
+  _MD_FILE="$file"
+  return 0
+}
+
+# Agrega desde un template literal.
+# $1 type, $2 profile, $3 name, $4... template
+_md_add() {
+  local type_name="$1" profile="$2" name="$3"; shift 3
+  local template="$*"
+  _md_prepare "$type_name" "$profile" "$name" || exit 1
+  mkdir -p "$_MD_SUBDIR"
+  printf '%s\n' "$template" > "$_MD_FILE"
+  log_ok "$type_name '$name' creado: $_MD_FILE"
+}
+
+# Agrega desde una URL GitHub — delega a _install_from_url.
+# $1 type, $2 profile, $3 name, $4 url
+_md_add_from_url() {
+  local type_name="$1" profile="$2" name="$3" url="$4"
+  _md_prepare "$type_name" "$profile" "$name" || exit 1
+  _install_from_url "$type_name" "$profile" "$name" "$url" "$_MD_FILE"
+}
+
+_md_remove() {
+  local type_name="$1" profile="$2" name="$3"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  local subdir; subdir="$(subdir_for_type "$type_name")"
+  local file="$profile_dir/$subdir/$name.md"
+
+  if [[ ! -f "$file" ]]; then
+    log_err "$type_name '$name' no existe"
+    exit 1
+  fi
+
+  local origin; origin="$(file_pack_origin "$profile" "$subdir/$name.md")"
+  if [[ -n "$origin" ]]; then
+    log_err "$type_name '$name' pertenece al pack '$origin'. Usá: ccp pack remove $profile $origin"
+    exit 1
+  fi
+
+  rm "$file"
+  log_ok "$type_name '$name' removido"
+}
+
+# ---------- cmd: agent/command/rule/reference add/remove ----------
+cmd_agent_add() {
+  local profile="$1" name="$2"; shift 2
+  _parse_add_extras "$@"
+  if [[ -n "$_FROM_URL" ]]; then
+    _md_add_from_url "agent" "$profile" "$name" "$_FROM_URL"
+  else
+    _md_add "agent" "$profile" "$name" "---
+name: $name
+description: TODO — describe the agent's role and when to delegate to it
+tools: Read, Grep, Edit
+---
+
+TODO — agent system prompt (write in English)."
+  fi
+}
+cmd_agent_remove() { _md_remove "agent" "$1" "$2"; }
+
+cmd_command_add() {
+  local profile="$1" name="$2"; shift 2
+  _parse_add_extras "$@"
+  if [[ -n "$_FROM_URL" ]]; then
+    _md_add_from_url "command" "$profile" "$name" "$_FROM_URL"
+  else
+    _md_add "command" "$profile" "$name" "---
+description: TODO — what this slash command does
+argument-hint: [args]
+---
+
+TODO — command instructions (write in English)."
+  fi
+}
+cmd_command_remove() { _md_remove "command" "$1" "$2"; }
+
+cmd_rule_add() {
+  local profile="$1" name="$2"; shift 2
+  _parse_add_extras "$@"
+  if [[ -n "$_FROM_URL" ]]; then
+    _md_add_from_url "rule" "$profile" "$name" "$_FROM_URL"
+  else
+    _md_add "rule" "$profile" "$name" "# TODO — rule title
+
+- TODO: rules as bullet points (write in English)"
+  fi
+}
+cmd_rule_remove() { _md_remove "rule" "$1" "$2"; }
+
+cmd_reference_add() {
+  local profile="$1" name="$2"; shift 2
+  _parse_add_extras "$@"
+  if [[ -n "$_FROM_URL" ]]; then
+    _md_add_from_url "reference" "$profile" "$name" "$_FROM_URL"
+  else
+    _md_add "reference" "$profile" "$name" "# TODO — reference title
+
+Checklist / reusable reference invokable from skills (write in English).
+
+- TODO"
+  fi
+}
+cmd_reference_remove() { _md_remove "reference" "$1" "$2"; }
+
+# ---------- cmd: script add/remove ----------
+cmd_script_add() {
+  local profile="$1" name="$2"; shift 2
+  _parse_add_extras "$@"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  validate_resource_name "$name" || exit 1
+
+  local fname="$name"
+  [[ "$fname" == *.sh ]] || fname="${fname}.sh"
+
+  local file="$profile_dir/scripts/$fname"
+  if [[ -e "$file" ]]; then
+    local origin; origin="$(file_pack_origin "$profile" "scripts/$fname")"
+    if [[ -n "$origin" ]]; then
+      die "Script '$fname' ya existe y pertenece al pack '$origin'"
+    else
+      die "Script '$fname' ya existe"
+    fi
+  fi
+
+  mkdir -p "$profile_dir/scripts"
+
+  if [[ -n "$_FROM_URL" ]]; then
+    local search_name="${name%.sh}"
+    _install_from_url "script" "$profile" "$search_name" "$_FROM_URL" "$file"
+    return 0
+  fi
+
+  cat > "$file" <<'SCRIPT_EOF'
+#!/usr/bin/env bash
+# TODO — descripción
+set -euo pipefail
+
+echo "TODO: implementar"
+SCRIPT_EOF
+  chmod +x "$file"
+  log_ok "Script '$fname' creado (ejecutable): $file"
+}
+
+cmd_script_remove() {
+  local profile="$1" name="$2"
+  local profile_dir; profile_dir="$(profile_dir_or_fail "$profile")"
+  local fname="$name"
+  [[ "$fname" == *.sh ]] || fname="${fname}.sh"
+
+  local file="$profile_dir/scripts/$fname"
+  if [[ ! -f "$file" ]]; then
+    log_err "Script '$fname' no existe"
+    exit 1
+  fi
+
+  local origin; origin="$(file_pack_origin "$profile" "scripts/$fname")"
+  if [[ -n "$origin" ]]; then
+    log_err "Script '$fname' pertenece al pack '$origin'"
+    exit 1
+  fi
+
+  rm "$file"
+  log_ok "Script '$fname' removido"
+}
+
+# ---------- cmd: mcp add/add-json/remove ----------
+_mcp_write_entry() {
+  local profile="$1" name="$2" config="$3"
+  local profile_dir; profile_dir="$PROFILES_DIR/$profile"
+  local mcp_file="$profile_dir/mcp.json"
+
+  [[ -f "$mcp_file" ]] || echo '{"mcpServers":{}}' > "$mcp_file"
+
+  if jq -e --arg n "$name" '.mcpServers[$n]' "$mcp_file" >/dev/null 2>&1; then
+    log_err "MCP '$name' ya existe en el perfil"
+    exit 1
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  jq --arg n "$name" --argjson c "$config" '.mcpServers[$n] = $c' "$mcp_file" > "$tmp"
+  mv "$tmp" "$mcp_file"
+  log_ok "MCP '$name' agregado: $mcp_file"
+}
+
+cmd_mcp_add() {
+  local profile="$1" name="$2"; shift 2
+  profile_dir_or_fail "$profile" >/dev/null
+  validate_resource_name "$name" || exit 1
+
+  [[ $# -eq 0 ]] && die "Falta el comando. Uso: mcp add <profile> <name> <command> [args]..."
+
+  local command="$1"; shift
+  local args_json; args_json="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+  local config; config="$(jq -n --arg cmd "$command" --argjson args "$args_json" \
+    '{type:"stdio",command:$cmd,args:$args}')"
+
+  _mcp_write_entry "$profile" "$name" "$config"
+}
+
+cmd_mcp_add_json() {
+  local profile="$1" name="$2" json="$3"
+  profile_dir_or_fail "$profile" >/dev/null
+  validate_resource_name "$name" || exit 1
+
+  if ! echo "$json" | jq empty >/dev/null 2>&1; then
+    log_err "JSON inválido"
+    exit 1
+  fi
+
+  _mcp_write_entry "$profile" "$name" "$json"
+}
+
+cmd_mcp_remove() {
+  local profile="$1" name="$2"
+  profile_dir_or_fail "$profile" >/dev/null
+  local mcp_file="$PROFILES_DIR/$profile/mcp.json"
+
+  if [[ ! -f "$mcp_file" ]]; then
+    log_err "El perfil no tiene mcp.json"
+    exit 1
+  fi
+
+  if ! jq -e --arg n "$name" '.mcpServers[$n]' "$mcp_file" >/dev/null 2>&1; then
+    log_err "MCP '$name' no existe en el perfil"
+    exit 1
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  jq --arg n "$name" 'del(.mcpServers[$n])' "$mcp_file" > "$tmp"
+  mv "$tmp" "$mcp_file"
+
+  if [[ "$(jq '.mcpServers | length' "$mcp_file")" == "0" ]]; then
+    rm "$mcp_file"
+    log_info "mcp.json quedó vacío, borrado."
+  fi
+
+  log_ok "MCP '$name' removido"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# DRAFTS — creación de recursos asistida por IA (claude CLI headless)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Storage global (fuera de perfiles, no ligado a ninguno):
+#   drafts/
+#   ├── .history.json          log de installs: [{type,name,profile,installed_at}]
+#   ├── skills/<name>/         dir con SKILL.md + subdirs
+#   │   ├── SKILL.md
+#   │   ├── scripts/...
+#   │   ├── .meta.json         {prompt, iterations, current_version}
+#   │   └── .versions/v{N}/    snapshots para diff
+#   ├── rules/<name>.md        archivo único
+#   ├── agents/<name>.md
+#   ├── commands/<name>.md
+#   └── references/<name>.md
+#
+# Meta de rules/agents/commands/references (files):
+#   drafts/<type>/.meta/<name>.json
+# ═══════════════════════════════════════════════════════════════════════
+
+# Tipos que son directorio (tienen marker) vs archivo.
+# Derivado de KIND_MARKER: si hay marker → dir, si no → file.
+_draft_is_dir_type() {
+  local m; m="$(kind_marker "$1")"
+  [[ -n "$m" ]]
+}
+
+# Path del draft (dir o archivo según tipo).
+_draft_path() {
+  local type_name="$1" name="$2"
+  local subdir; subdir="$(kind_subdir "$type_name")"
+  if _draft_is_dir_type "$type_name"; then
+    echo "$DRAFTS_DIR/$subdir/$name"
+  else
+    echo "$DRAFTS_DIR/$subdir/$name.md"
+  fi
+}
+
+# Path del .meta.json.
+_draft_meta_path() {
+  local type_name="$1" name="$2"
+  local subdir; subdir="$(kind_subdir "$type_name")"
+  if _draft_is_dir_type "$type_name"; then
+    echo "$DRAFTS_DIR/$subdir/$name/.meta.json"
+  else
+    echo "$DRAFTS_DIR/$subdir/.meta/$name.json"
+  fi
+}
+
+# Path del dir de versiones (para diff entre iteraciones).
+_draft_versions_dir() {
+  local type_name="$1" name="$2"
+  local subdir; subdir="$(kind_subdir "$type_name")"
+  if _draft_is_dir_type "$type_name"; then
+    echo "$DRAFTS_DIR/$subdir/$name/.versions"
+  else
+    echo "$DRAFTS_DIR/$subdir/.versions/$name"
+  fi
+}
+
+_draft_exists() {
+  local type_name="$1" name="$2"
+  local p; p="$(_draft_path "$type_name" "$name")"
+  [[ -e "$p" ]]
+}
+
+# Inicializa DRAFTS_DIR y .history.json si no existen.
+_drafts_init() {
+  mkdir -p "$DRAFTS_DIR"
+  [[ -f "$DRAFTS_HISTORY" ]] || echo "[]" > "$DRAFTS_HISTORY"
+}
+
+# Lee el .meta.json del draft (devuelve {} si no existe).
+_draft_read_meta() {
+  local type_name="$1" name="$2"
+  local p; p="$(_draft_meta_path "$type_name" "$name")"
+  if [[ -f "$p" ]]; then cat "$p"; else echo '{}'; fi
+}
+
+# Escribe el .meta.json (recibe JSON por stdin).
+_draft_write_meta() {
+  local type_name="$1" name="$2"
+  local p; p="$(_draft_meta_path "$type_name" "$name")"
+  mkdir -p "$(dirname "$p")"
+  cat > "$p"
+}
+
+# Registra un install en history.json.
+_drafts_history_add() {
+  local type_name="$1" name="$2" profile="$3"
+  _drafts_init
+  local now; now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local tmp; tmp="$(mktemp)"
+  jq --arg t "$type_name" --arg n "$name" --arg p "$profile" --arg ts "$now" \
+    '. += [{type:$t,name:$n,profile:$p,installed_at:$ts}]' \
+    "$DRAFTS_HISTORY" > "$tmp"
+  mv "$tmp" "$DRAFTS_HISTORY"
+}
+
+# Enumera drafts pendientes (existen en disco).
+# Output: líneas "type\tname"
+_drafts_pending() {
+  [[ -d "$DRAFTS_DIR" ]] || return 0
+  local subdir t p
+  for t in skill agent command rule reference; do
+    subdir="$(kind_subdir "$t")"
+    local base="$DRAFTS_DIR/$subdir"
+    [[ -d "$base" ]] || continue
+    if _draft_is_dir_type "$t"; then
+      for p in "$base"/*/; do
+        [[ -d "$p" ]] || continue
+        local n; n="$(basename "$p")"
+        [[ "$n" == ".versions" || "$n" == ".meta" ]] && continue
+        echo -e "${t}\t${n}"
+      done
+    else
+      for p in "$base"/*.md; do
+        [[ -f "$p" ]] || continue
+        local n; n="$(basename "$p" .md)"
+        echo -e "${t}\t${n}"
+      done
+    fi
+  done
+}
+
+# Borra un draft (archivos + meta + versiones).
+_draft_remove_workspace() {
+  local type_name="$1" name="$2"
+  local path; path="$(_draft_path "$type_name" "$name")"
+  local meta; meta="$(_draft_meta_path "$type_name" "$name")"
+  local vers; vers="$(_draft_versions_dir "$type_name" "$name")"
+  [[ -e "$path" ]] && rm -rf "$path"
+  [[ -f "$meta" ]] && rm -f "$meta"
+  [[ -d "$vers" ]] && rm -rf "$vers"
+}
+
+# ---------- Prompt templates por tipo ----------
+# La IA debe devolver bloques <file path="...">...</file> para poder soportar
+# skills multi-archivo. Para rules/agents/commands/references será 1 solo bloque.
+_draft_prompt_for() {
+  local type_name="$1" description="$2" current="${3:-}" name="${4:-recurso}"
+
+  local format_spec=""
+  case "$type_name" in
+    skill)
+      format_spec="Generate a SKILL for Claude Code.
+
+A SKILL lives in a directory with this structure:
+- SKILL.md (required, at the ROOT of the skill) with YAML frontmatter:
+    ---
+    name: <kebab-case-name>
+    description: <when Claude should invoke it — specific and actionable>
+    ---
+  Followed by instructions in markdown.
+- Optional subdirectories: scripts/ (executable helpers), references/ (lookup docs), examples/ (samples).
+
+Rules:
+- The name in the frontmatter must be kebab-case and match the name requested by the user: '$name'.
+- The description must clearly state \"when to use\" — Claude uses it to auto-invoke.
+- Instructions must be concrete, action-oriented.
+- If the skill needs helper scripts, generate them in scripts/ with shebang #!/usr/bin/env bash.
+
+CRITICAL about paths in <file path=\"...\"> blocks:
+- Paths are RELATIVE to the root of the skill (NOT from the repo root, NOT prefixed with the skill name).
+- CORRECT:   <file path=\"SKILL.md\">
+- CORRECT:   <file path=\"scripts/helper.sh\">
+- WRONG:     <file path=\"my-skill-name/SKILL.md\">
+- WRONG:     <file path=\"skills/my-skill-name/SKILL.md\">"
+      ;;
+    rule)
+      format_spec='Generate a RULE for Claude Code.
+
+A rule is a .md file with guidelines/constraints. Optional frontmatter:
+  ---
+  paths:
+    - src/**/*.ts
+  ---
+Without `paths`, it always applies. The body is bullet points with clear rules.'
+      ;;
+    agent)
+      format_spec='Generate an AGENT for Claude Code.
+
+A .md file with frontmatter:
+  ---
+  name: <kebab-case>
+  description: <when to delegate to this subagent>
+  tools: Read, Grep, Edit
+  ---
+Followed by instructions describing the agent role.'
+      ;;
+    command)
+      format_spec='Generate a SLASH COMMAND for Claude Code.
+
+A .md file with frontmatter:
+  ---
+  description: <what it does>
+  argument-hint: "[args]"
+  ---
+Followed by instructions. You can reference $ARGUMENTS for user input.'
+      ;;
+    reference)
+      format_spec='Generate a REFERENCE for Claude Code.
+
+A free-form .md — checklist, guide, or lookup resource invokable from skills/agents. No strict frontmatter required.'
+      ;;
+  esac
+
+  local base_prompt="You are a Claude Code expert. Generate a resource of type '$type_name'.
+
+$format_spec
+
+LANGUAGE REQUIREMENT (CRITICAL):
+- Write ALL generated content in ENGLISH, regardless of the language the user writes the description in.
+- This includes: frontmatter fields (name, description, argument-hint, etc.), instructions, comments in code, everything.
+- Claude Code convention: all skills/rules/agents ship in English so they work across teams and match the model's strongest comprehension.
+
+REQUIRED OUTPUT FORMAT:
+Return one or more blocks exactly like this:
+
+<file path=\"relative/path\">
+<<file contents>>
+</file>
+
+- For rule/agent/command/reference: ONE single block where path = the .md file.
+- For skill: at least SKILL.md at the root of the directory; you can add scripts/X.sh, references/Y.md, etc.
+- Do NOT include anything outside <file>...</file> blocks — no intro, no explanation, no summary at the end.
+
+USER REQUEST:
+$description"
+
+  if [[ -n "$current" ]]; then
+    base_prompt+="
+
+CURRENT STATE (refine on top of this — keep English):
+$current"
+  fi
+
+  echo "$base_prompt"
+}
+
+# Invoca claude CLI headless. Recibe prompt por stdin, devuelve output por stdout.
+_ai_invoke() {
+  command -v claude >/dev/null 2>&1 || die "claude CLI no está instalado. Instala con: npm install -g @anthropic-ai/claude-code"
+  local prompt="$1"
+  # --print (no interactivo) + --output-format text (solo stdout)
+  echo "$prompt" | claude -p
+}
+
+# Parser: extrae bloques <file path="...">...</file> del output de la IA.
+# Los escribe en el directorio target preservando paths relativos.
+# $1: output de la IA, $2: target dir
+# Devuelve el número de archivos escritos en stdout.
+#
+# State machine en bash puro (compatible con bash 3.2 / BSD tools).
+_parse_and_write_files() {
+  local content="$1" target="$2"
+  mkdir -p "$target"
+
+  local count=0
+  local in_block=0
+  local current_path=""
+  local current_buf=""
+  local line
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( in_block == 0 )); then
+      # Buscar apertura: <file path="...">
+      if [[ "$line" =~ ^[[:space:]]*\<file[[:space:]]+path=\"([^\"]+)\"\>[[:space:]]*$ ]]; then
+        current_path="${BASH_REMATCH[1]}"
+        # Sanitizar: sin .. ni prefijo absoluto
+        current_path="${current_path//../}"
+        current_path="${current_path#/}"
+        current_buf=""
+        in_block=1
+      fi
+    else
+      # Buscar cierre: </file>
+      if [[ "$line" =~ ^[[:space:]]*\</file\>[[:space:]]*$ ]]; then
+        # Escribir archivo
+        local dst="$target/$current_path"
+        mkdir -p "$(dirname "$dst")"
+        # Quitar el \n final del buffer si quedó
+        printf '%s' "$current_buf" > "$dst"
+        [[ "$dst" == *.sh ]] && chmod +x "$dst"
+        count=$((count + 1))
+        in_block=0
+        current_path=""
+        current_buf=""
+      else
+        current_buf+="$line"$'\n'
+      fi
+    fi
+  done <<< "$content"
+
+  echo "$count"
+}
+
+# Guarda una versión actual del draft en .versions/v{N}/
+_draft_snapshot_version() {
+  local type_name="$1" name="$2"
+  local src; src="$(_draft_path "$type_name" "$name")"
+  local vdir; vdir="$(_draft_versions_dir "$type_name" "$name")"
+  [[ -e "$src" ]] || return 0
+
+  mkdir -p "$vdir"
+  local next; next="$(find "$vdir" -maxdepth 1 -type d -name 'v*' 2>/dev/null | wc -l | tr -d ' ')"
+  next=$((next + 1))
+  local target="$vdir/v$next"
+
+  if [[ -d "$src" ]]; then
+    # Clone sin .versions ni .meta
+    mkdir -p "$target"
+    ( cd "$src" && tar cf - --exclude='.versions' --exclude='.meta.json' . ) | ( cd "$target" && tar xf - )
+  else
+    cp "$src" "$target.md"
+  fi
+}
+
+# Genera o refina un draft. Crea si no existe, refina si existe.
+# $1: type, $2: name, $3: descripción o feedback
+_draft_generate() {
+  local type_name="$1" name="$2" user_input="$3"
+  _drafts_init
+
+  local current=""
+  if _draft_exists "$type_name" "$name"; then
+    # Snapshot versión actual antes de refinar
+    _draft_snapshot_version "$type_name" "$name"
+    # Leer estado actual para el prompt
+    current="$(_draft_collect_content "$type_name" "$name")"
+  fi
+
+  local prompt; prompt="$(_draft_prompt_for "$type_name" "$user_input" "$current" "$name")"
+
+  spinner_start "generando con Claude"
+  local ai_output; ai_output="$(_ai_invoke "$prompt")"
+  spinner_stop
+
+  [[ -z "$ai_output" ]] && die "Claude devolvió output vacío"
+
+  # Si el draft ya existía, borrar contenido anterior (ya snapshot-eado)
+  if _draft_exists "$type_name" "$name"; then
+    local path; path="$(_draft_path "$type_name" "$name")"
+    if [[ -d "$path" ]]; then
+      # Borrar todo excepto .versions y .meta.json
+      find "$path" -mindepth 1 -maxdepth 1 ! -name '.versions' ! -name '.meta.json' -exec rm -rf {} +
+    else
+      rm -f "$path"
+    fi
+  fi
+
+  # Escribir archivos nuevos
+  local target; target="$(_draft_path "$type_name" "$name")"
+  if ! _draft_is_dir_type "$type_name"; then
+    # Para files, target es el archivo; creamos dir padre
+    mkdir -p "$(dirname "$target")"
+    # Parser escribe en un dir temporal, luego movemos el primer archivo al target
+    local tmp_dst; tmp_dst="$(mktemp -d)"
+    local count; count="$(_parse_and_write_files "$ai_output" "$tmp_dst")"
+    if [[ "$count" -eq 0 ]]; then
+      rm -rf "$tmp_dst"
+      die "la IA no devolvió archivos parseables"
+    fi
+    # Mover el primer .md que encontremos a target
+    local first; first="$(find "$tmp_dst" -type f -name '*.md' | head -1)"
+    if [[ -z "$first" ]]; then
+      rm -rf "$tmp_dst"
+      die "la IA no devolvió ningún .md"
+    fi
+    mv "$first" "$target"
+    rm -rf "$tmp_dst"
+  else
+    local count; count="$(_parse_and_write_files "$ai_output" "$target")"
+    if [[ "$count" -eq 0 ]]; then
+      die "la IA no devolvió archivos parseables"
+    fi
+    local marker; marker="$(kind_marker "$type_name")"
+    [[ -f "$target/$marker" ]] || die "la IA no incluyó $marker en el output (requerido para $type_name)"
+  fi
+
+  # Actualizar .meta.json
+  local now; now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local existing; existing="$(_draft_read_meta "$type_name" "$name")"
+  local updated
+  if [[ "$existing" == "{}" ]]; then
+    updated="$(jq -n --arg t "$type_name" --arg n "$name" --arg p "$user_input" --arg ts "$now" \
+      '{type:$t,name:$n,created_at:$ts,iterations:[{version:1,prompt:$p,at:$ts}]}')"
+  else
+    local next_v; next_v="$(echo "$existing" | jq '(.iterations | length) + 1')"
+    updated="$(echo "$existing" | jq --arg f "$user_input" --arg ts "$now" --argjson v "$next_v" \
+      '.iterations += [{version:$v,feedback:$f,at:$ts}]')"
+  fi
+  echo "$updated" | _draft_write_meta "$type_name" "$name"
+}
+
+# Lee el contenido actual del draft para pasarlo como contexto a la IA al refinar.
+_draft_collect_content() {
+  local type_name="$1" name="$2"
+  local path; path="$(_draft_path "$type_name" "$name")"
+  if [[ -f "$path" ]]; then
+    cat "$path"
+  elif [[ -d "$path" ]]; then
+    # Dump todos los archivos como bloques <file>
+    local f rel
+    while IFS= read -r -d '' f; do
+      rel="${f#$path/}"
+      printf '<file path="%s">\n' "$rel"
+      cat "$f"
+      printf '\n</file>\n\n'
+    done < <(find "$path" -type f ! -path '*/.versions/*' ! -name '.meta.json' -print0)
+  fi
+}
+
+# Preview full: muestra todos los archivos del draft con headers.
+_draft_preview() {
+  local type_name="$1" name="$2"
+  local path; path="$(_draft_path "$type_name" "$name")"
+  [[ -e "$path" ]] || { log_warn "draft no tiene archivos aún"; return 0; }
+
+  hr "━" "$C_INFO"
+  if [[ -f "$path" ]]; then
+    printf "  %b▸%b %s\n" "$C_ACID" "$C_RESET" "$(basename "$path")"
+    hr "─" "$C_DARK"
+    cat "$path"
+  else
+    local f rel
+    while IFS= read -r -d '' f; do
+      rel="${f#$path/}"
+      printf "\n  %b▸%b %s\n" "$C_ACID" "$C_RESET" "$rel"
+      hr "─" "$C_DARK"
+      cat "$f"
+    done < <(find "$path" -type f ! -path '*/.versions/*' ! -name '.meta.json' -print0 | sort -z)
+  fi
+  hr "━" "$C_INFO"
+}
+
+# ---------- REPL loop ----------
+_draft_repl() {
+  local type_name="$1" name="$2"
+
+  while true; do
+    _draft_preview "$type_name" "$name"
+    echo
+    printf "  %b▸%b opciones: %b[i]%bnstall  %b[e]%bdit  %b[r]%befine  %b[d]%biff  %b[s]%bave&quit  %b[x]%b discard\n" \
+      "$C_INFO" "$C_RESET" "$C_ACID" "$C_RESET" "$C_ACID" "$C_RESET" "$C_ACID" "$C_RESET" "$C_ACID" "$C_RESET" "$C_ACID" "$C_RESET" "$C_ACID" "$C_RESET"
+    local choice
+    # Si stdin cerró (pipe terminó), tratamos como save & quit.
+    if ! read -r -p "  > " choice; then
+      log_ok "draft '$name' guardado (stdin cerrado). Retomá con: ccp draft refine $type_name $name"
+      return 0
+    fi
+    case "$choice" in
+      i|I) _draft_install_interactive "$type_name" "$name"; return 0 ;;
+      e|E) _draft_edit "$type_name" "$name" ;;
+      r|R)
+        printf "  %b▸%b Feedback (fin con Ctrl+D):\n" "$C_INFO" "$C_RESET"
+        local feedback; feedback="$(cat)"
+        [[ -z "$feedback" ]] && { log_warn "feedback vacío — skip"; continue; }
+        _draft_generate "$type_name" "$name" "$feedback"
+        ;;
+      d|D) _draft_diff "$type_name" "$name" ;;
+      s|S) log_ok "draft '$name' guardado. Retomá con: ccp draft refine $type_name $name"; return 0 ;;
+      x|X)
+        local confirm
+        if ! read -r -p "  ¿Descartar draft '$name'? [y/N] " confirm; then
+          return 0
+        fi
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+          _draft_remove_workspace "$type_name" "$name"
+          log_ok "draft descartado"
+          return 0
+        fi
+        ;;
+      *) log_warn "opción no reconocida: $choice" ;;
+    esac
+  done
+}
+
+# Editor: abre el archivo (file) o el dir (skill) en $EDITOR.
+_draft_edit() {
+  local type_name="$1" name="$2"
+  local path; path="$(_draft_path "$type_name" "$name")"
+  local editor="${EDITOR:-vi}"
+  if [[ -d "$path" ]]; then
+    # Abrir SKILL.md por defecto (más común de tocar)
+    "$editor" "$path/$(kind_marker "$type_name")"
+  else
+    "$editor" "$path"
+  fi
+}
+
+# Diff vs versión anterior.
+_draft_diff() {
+  local type_name="$1" name="$2"
+  local vdir; vdir="$(_draft_versions_dir "$type_name" "$name")"
+  [[ -d "$vdir" ]] || { log_warn "no hay versiones anteriores para diff"; return 0; }
+  local latest; latest="$(find "$vdir" -maxdepth 1 -name 'v*' | sort -V | tail -1)"
+  [[ -z "$latest" ]] && { log_warn "no hay versiones guardadas"; return 0; }
+  local current; current="$(_draft_path "$type_name" "$name")"
+
+  hr "━" "$C_INFO"
+  printf "  %b▸%b diff con %s\n" "$C_INFO" "$C_RESET" "$(basename "$latest")"
+  hr "─" "$C_DARK"
+  if [[ -f "$current" ]]; then
+    diff -u "$latest.md" "$current" || true
+  else
+    diff -ruN "$latest" "$current" || true
+  fi
+  hr "━" "$C_INFO"
+}
+
+# Install interactivo: pregunta perfil(es), maneja conflict.
+_draft_install_interactive() {
+  local type_name="$1" name="$2"
+
+  # Listar perfiles disponibles
+  local available=""
+  for d in "$PROFILES_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    local pn; pn="$(basename "$d")"
+    [[ "$pn" == "_"* ]] && continue
+    available+="$pn "
+  done
+
+  printf "  %b▸%b Perfiles disponibles: %b%s%b\n" "$C_INFO" "$C_RESET" "$C_ACID" "$available" "$C_RESET"
+  printf "  %b▸%b También: %bglobal%b (instala en ~/.claude/)\n" "$C_INFO" "$C_RESET" "$C_GOLD" "$C_RESET"
+  local input
+  read -r -p "  ¿En qué perfil(es) instalar? (coma-separado, o 'global'): " input
+  [[ -z "$input" ]] && { log_warn "instalación cancelada"; return 0; }
+
+  # Parse profiles
+  local profiles; profiles="$(echo "$input" | tr ',' ' ')"
+  local p
+  for p in $profiles; do
+    p="$(echo "$p" | xargs)"  # trim
+    [[ -z "$p" ]] && continue
+    _draft_install_one "$type_name" "$name" "$p"
+  done
+
+  # Cleanup workspace post-install
+  _draft_remove_workspace "$type_name" "$name"
+  log_ok "draft '$name' instalado y removido del workspace"
+}
+
+# Instala un draft en un perfil específico. Con prompt de overwrite.
+# Dispatcher: si target es "global" → install en ~/.claude/; sino perfil.
+_draft_install_one() {
+  local type_name="$1" name="$2" target="$3"
+  if [[ "$target" == "global" ]]; then
+    _draft_install_one_global "$type_name" "$name"
+    return $?
+  fi
+  _draft_install_one_profile "$type_name" "$name" "$target"
+}
+
+# Install en ~/.claude/ (global). Soporta skill/agent/command.
+# rule/reference no tienen convención global oficial — warnean pero copian.
+_draft_install_one_global() {
+  local type_name="$1" name="$2"
+  local claude_home="$HOME/.claude"
+  local src; src="$(_draft_path "$type_name" "$name")"
+  local subdir; subdir="$(kind_subdir "$type_name")"
+  local dst
+  if _draft_is_dir_type "$type_name"; then
+    dst="$claude_home/$subdir/$name"
+  else
+    dst="$claude_home/$subdir/$name.md"
+  fi
+
+  case "$type_name" in
+    skill|agent|command) ;;
+    rule|reference)
+      log_warn "Claude Code no detecta '$type_name' globalmente por convención — instalando igual, usá bajo tu propio criterio."
+      ;;
+    script)
+      die "scripts no se instalan globalmente — van dentro de skills o en ~/.claude/hooks/ a mano"
+      ;;
+  esac
+
+  if [[ -e "$dst" ]]; then
+    read -r -p "  ya existe global/$subdir/$name — ¿sobrescribir? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      log_warn "skip global"
+      return 1
+    fi
+    rm -rf "$dst"
+  fi
+
+  mkdir -p "$(dirname "$dst")"
+  if _draft_is_dir_type "$type_name"; then
+    mkdir -p "$dst"
+    ( cd "$src" && tar cf - --exclude='.versions' --exclude='.meta.json' . ) | ( cd "$dst" && tar xf - )
+  else
+    cp "$src" "$dst"
+  fi
+
+  _drafts_history_add "$type_name" "$name" "global"
+  log_ok "instalado en ~/.claude/$subdir/$name"
+}
+
+_draft_install_one_profile() {
+  local type_name="$1" name="$2" profile="$3"
+  local profile_dir; profile_dir="$PROFILES_DIR/$profile"
+  [[ -d "$profile_dir" ]] || { log_err "perfil no existe: $profile — skip"; return 1; }
+
+  local src; src="$(_draft_path "$type_name" "$name")"
+  local subdir; subdir="$(kind_subdir "$type_name")"
+  local dst
+  if _draft_is_dir_type "$type_name"; then
+    dst="$profile_dir/$subdir/$name"
+  else
+    dst="$profile_dir/$subdir/$name.md"
+  fi
+
+  # Check pack origin: si ya existe y viene de un pack, abortar
+  if [[ -e "$dst" ]]; then
+    local rel
+    if _draft_is_dir_type "$type_name"; then
+      rel="$subdir/$name"
+    else
+      rel="$subdir/$name.md"
+    fi
+    local origin; origin="$(file_pack_origin "$profile" "$rel")"
+    if [[ -n "$origin" ]]; then
+      log_err "ya existe en $profile y pertenece al pack '$origin' — skip"
+      return 1
+    fi
+
+    read -r -p "  ya existe $profile/$rel — ¿sobrescribir? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      log_warn "skip $profile"
+      return 1
+    fi
+    rm -rf "$dst"
+  fi
+
+  mkdir -p "$(dirname "$dst")"
+  if _draft_is_dir_type "$type_name"; then
+    # Copiar sin .versions ni .meta.json
+    mkdir -p "$dst"
+    ( cd "$src" && tar cf - --exclude='.versions' --exclude='.meta.json' . ) | ( cd "$dst" && tar xf - )
+  else
+    cp "$src" "$dst"
+  fi
+
+  _drafts_history_add "$type_name" "$name" "$profile"
+  log_ok "instalado en $profile/$subdir/"
+}
+
+# ---------- cmd: draft create / refine / install / list / discard / history ----------
+cmd_draft_create() {
+  local type_name="$1" name="$2"
+  case "$type_name" in
+    skill|rule|agent|command|reference) ;;
+    *) die "tipo inválido: $type_name (usá skill/rule/agent/command/reference)" ;;
+  esac
+  validate_resource_name "$name" || exit 1
+  _drafts_init
+
+  _draft_exists "$type_name" "$name" && die "draft '$name' ya existe. Usá 'draft refine' para iterar o 'draft discard' primero."
+
+  log_step "Crear draft ($type_name): $name"
+  printf "  %b▸%b Describí la idea (Ctrl+D para terminar):\n" "$C_INFO" "$C_RESET"
+  local description; description="$(cat)"
+  [[ -z "$description" ]] && die "descripción vacía"
+
+  _draft_generate "$type_name" "$name" "$description"
+  _draft_repl "$type_name" "$name"
+}
+
+cmd_draft_refine() {
+  local type_name="$1" name="$2"
+  _draft_exists "$type_name" "$name" || die "draft no existe: $type_name/$name"
+
+  log_step "Retomar draft ($type_name): $name"
+  _draft_repl "$type_name" "$name"
+}
+
+cmd_draft_list() {
+  local show_all=0
+  [[ "${1:-}" == "--all" ]] && show_all=1
+
+  _drafts_init
+  banner "DRAFTS" "workspace: $DRAFTS_DIR"
+
+  local pending; pending="$(_drafts_pending)"
+  local p_count=0
+  if [[ -n "$pending" ]]; then
+    p_count="$(wc -l <<< "$pending" | tr -d ' ')"
+  fi
+
+  subhead "pendientes" "($p_count)"
+  if [[ -z "$pending" ]]; then
+    printf "    %b(ninguno)%b\n" "$C_DIM" "$C_RESET"
+  else
+    while IFS=$'\t' read -r t n; do
+      [[ -z "$t" ]] && continue
+      local meta; meta="$(_draft_read_meta "$t" "$n")"
+      local iters; iters="$(echo "$meta" | jq -r '.iterations | length // 0')"
+      item "$t · $n" "iteraciones: $iters"
+    done <<< "$pending"
+  fi
+  echo
+
+  if (( show_all )); then
+    local hist_count; hist_count="$(jq 'length' "$DRAFTS_HISTORY" 2>/dev/null || echo 0)"
+    subhead "historial de installs" "($hist_count)"
+    if [[ "$hist_count" == "0" ]]; then
+      printf "    %b(vacío)%b\n" "$C_DIM" "$C_RESET"
+    else
+      jq -r '.[] | "\(.type)\t\(.name)\t\(.profile)\t\(.installed_at)"' "$DRAFTS_HISTORY" | \
+      while IFS=$'\t' read -r t n p ts; do
+        item "$t · $n → $p" "$ts"
+      done
+    fi
+    echo
+  fi
+}
+
+cmd_draft_install() {
+  local type_name="$1" name="$2" profiles_arg="$3"
+  _draft_exists "$type_name" "$name" || die "draft no existe: $type_name/$name"
+
+  local profiles; profiles="$(echo "$profiles_arg" | tr ',' ' ')"
+  local p
+  for p in $profiles; do
+    p="$(echo "$p" | xargs)"
+    [[ -z "$p" ]] && continue
+    _draft_install_one "$type_name" "$name" "$p"
+  done
+  _draft_remove_workspace "$type_name" "$name"
+  log_ok "draft '$name' instalado"
+}
+
+cmd_draft_discard() {
+  local type_name="$1" name="$2"
+  _draft_exists "$type_name" "$name" || die "draft no existe: $type_name/$name"
+  _draft_remove_workspace "$type_name" "$name"
+  log_ok "draft '$name' descartado"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# APPLY — aplica un perfil al repositorio actual (PWD)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Mergea de forma idempotente:
+#   - CLAUDE.md del perfil         → append a ./CLAUDE.md (con marker)
+#   - settings.json del perfil     → merge con ./.claude/settings.json
+#   - mcp.json del perfil          → merge con ./.mcp.json
+#   - rules/skills/agents/commands/references/scripts → copia a ./.claude/...
+#
+# Usa variables globales _APPLY_* para compartir estado entre helpers sin
+# pasar por args (mejora legibilidad del pipeline).
+# ═══════════════════════════════════════════════════════════════════════
+
+_apply_do_cmd() {
+  if (( _APPLY_DRY_RUN )); then
+    local preview="" arg
+    for arg in "$@"; do
+      if [[ "$arg" =~ [[:space:]\'\"] ]]; then
+        preview+=" \"${arg//\"/\\\"}\""
+      else
+        preview+=" $arg"
+      fi
+    done
+    printf "  %b[dry-run]%b%s\n" "$C_DIM" "$C_RESET" "$preview"
+  else
+    "$@"
+  fi
+}
+
+_apply_section() {
+  printf "  %b⬢%b  %b%s%b\n" "$C_NEON" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"
+}
+
+_apply_claude_md() {
+  _apply_section "CLAUDE.md"
+  local src="$_APPLY_PROFILE_DIR/CLAUDE.md"
+  local dst="$_APPLY_TARGET_DIR/CLAUDE.md"
+
+  if [[ ! -f "$src" ]]; then
+    log_info "perfil no incluye CLAUDE.md — skip"; echo; return 0
+  fi
+
+  local marker="<!-- apply-profile: $_APPLY_PROFILE -->"
+  local emarker="<!-- /apply-profile: $_APPLY_PROFILE -->"
+
+  if [[ ! -f "$dst" ]]; then
+    log_info "creando CLAUDE.md nuevo"
+    if (( _APPLY_DRY_RUN == 0 )); then
+      { echo "$marker"; cat "$src"; echo ""; echo "$emarker"; } > "$dst"
+    fi
+    log_ok "CLAUDE.md creado con sección del perfil $_APPLY_PROFILE"
+    echo; return 0
+  fi
+
+  if grep -Fq "$marker" "$dst"; then
+    log_warn "sección para '$_APPLY_PROFILE' ya existe — skip (usa --force para regenerar)"
+    if (( _APPLY_FORCE && _APPLY_DRY_RUN == 0 )); then
+      local tmpfile; tmpfile="$(mktemp)"
+      awk -v m="$marker" -v e="$emarker" '
+        $0 == m {skip=1; next}
+        $0 == e {skip=0; next}
+        !skip {print}
+      ' "$dst" > "$tmpfile"
+      {
+        cat "$tmpfile"; echo ""; echo "$marker"; cat "$src"; echo ""; echo "$emarker"
+      } > "$dst"
+      rm -f "$tmpfile"
+      log_ok "sección '$_APPLY_PROFILE' regenerada en CLAUDE.md (--force)"
+    fi
+    echo; return 0
+  fi
+
+  log_info "appendeando sección del perfil $_APPLY_PROFILE"
+  if (( _APPLY_DRY_RUN == 0 )); then
+    { echo ""; echo "$marker"; cat "$src"; echo ""; echo "$emarker"; } >> "$dst"
+  fi
+  log_ok "CLAUDE.md actualizado"
+  echo
+}
+
+_apply_settings() {
+  _apply_section ".claude/settings.json"
+  local src="$_APPLY_PROFILE_DIR/settings.json"
+  local dst_dir="$_APPLY_TARGET_DIR/.claude"
+  local dst="$dst_dir/settings.json"
+
+  [[ -f "$src" ]] || { log_info "perfil no incluye settings.json — skip"; echo; return 0; }
+
+  _apply_do_cmd mkdir -p "$dst_dir"
+
+  if [[ ! -f "$dst" ]]; then
+    log_info "creando .claude/settings.json"
+    _apply_do_cmd cp "$src" "$dst"
+    log_ok ".claude/settings.json creado"
+    echo; return 0
+  fi
+
+  log_info "mergeando .claude/settings.json existente"
+  if (( _APPLY_DRY_RUN == 0 )); then
+    local tmpfile; tmpfile="$(mktemp)"
+    jq -s '
+      def merge_hooks(a; b):
+        (((a // {}) + (b // {})) | keys_unsorted | unique) as $keys |
+        reduce $keys[] as $k (
+          {};
+          .[$k] = (((a // {})[$k] // []) + ((b // {})[$k] // []) | unique)
+        );
+
+      .[0] as $e | .[1] as $p |
+      $e
+      | .permissions.allow = (((($e.permissions // {}).allow // []) + (($p.permissions // {}).allow // [])) | unique)
+      | .permissions.deny  = (((($e.permissions // {}).deny  // []) + (($p.permissions // {}).deny  // [])) | unique)
+      | .env   = (($p.env // {}) + ($e.env // {}))
+      | .hooks = merge_hooks($e.hooks; $p.hooks)
+    ' "$dst" "$src" > "$tmpfile"
+    mv "$tmpfile" "$dst"
+  fi
+  log_ok ".claude/settings.json mergeado (allow/deny unidos, env existente gana, hooks acumulados)"
+  echo
+}
+
+_apply_mcp() {
+  _apply_section ".mcp.json"
+  local src="$_APPLY_PROFILE_DIR/mcp.json"
+  local dst="$_APPLY_TARGET_DIR/.mcp.json"
+
+  [[ -f "$src" ]] || { log_info "perfil no incluye mcp.json — skip"; echo; return 0; }
+
+  if [[ ! -f "$dst" ]]; then
+    log_info "creando .mcp.json"
+    _apply_do_cmd cp "$src" "$dst"
+    log_ok ".mcp.json creado"
+    echo; return 0
+  fi
+
+  log_info "mergeando .mcp.json existente"
+  if (( _APPLY_DRY_RUN == 0 )); then
+    local tmpfile; tmpfile="$(mktemp)"
+    jq -s '
+      .[0] as $e | .[1] as $p |
+      $e | .mcpServers = (($p.mcpServers // {}) + ($e.mcpServers // {}))
+    ' "$dst" "$src" > "$tmpfile"
+    mv "$tmpfile" "$dst"
+  fi
+  log_ok ".mcp.json mergeado (existentes ganan en colisión)"
+  echo
+}
+
+_apply_copy_files() {
+  local label="$1" src_sub="$2" dst_sub="$3" glob="$4"
+  local src_dir="$_APPLY_PROFILE_DIR/$src_sub"
+  local dst_dir="$_APPLY_TARGET_DIR/$dst_sub"
+
+  _apply_section "$label"
+
+  [[ -d "$src_dir" ]] || { log_info "perfil no incluye $src_sub/ — skip"; echo; return 0; }
+
+  shopt -s nullglob
+  local files=( "$src_dir"/$glob )
+  shopt -u nullglob
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    log_info "$src_sub/ vacío en el perfil — skip"; echo; return 0
+  fi
+
+  _apply_do_cmd mkdir -p "$dst_dir"
+
+  for f in "${files[@]}"; do
+    local name; name="$(basename "$f")"
+    local target="$dst_dir/$name"
+
+    if [[ -e "$target" ]]; then
+      if (( _APPLY_FORCE )); then
+        log_warn "sobrescribiendo $dst_sub/$name (--force)"
+        _apply_do_cmd rm -rf "$target"
+        if [[ -d "$f" ]]; then
+          _apply_do_cmd cp -R "$f" "$target"
+        else
+          _apply_do_cmd cp "$f" "$target"
+        fi
+        _APPLIED_FILES+=("$dst_sub/$name")
+      else
+        log_warn "$dst_sub/$name ya existe — skip"
+      fi
+    else
+      if [[ -d "$f" ]]; then
+        _apply_do_cmd cp -R "$f" "$target"
+      else
+        _apply_do_cmd cp "$f" "$target"
+      fi
+      _APPLIED_FILES+=("$dst_sub/$name")
+      log_ok "copiado $dst_sub/$name"
+    fi
+  done
+  echo
+}
+
+_apply_write_target_manifest() {
+  local manifest="$_APPLY_TARGET_DIR/.claude/.applied-profiles.json"
+  mkdir -p "$_APPLY_TARGET_DIR/.claude"
+
+  local existing="{}"
+  [[ -f "$manifest" ]] && existing="$(cat "$manifest")"
+
+  local now; now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local files_json; files_json="$(printf '%s\n' "${_APPLIED_FILES[@]}" | jq -R . | jq -s .)"
+
+  echo "$existing" | jq \
+    --arg p "$_APPLY_PROFILE" \
+    --arg t "$now" \
+    --argjson f "$files_json" \
+    '.[$p] = {applied_at: $t, files: $f}' > "$manifest"
+}
+
+_apply_uninstall_impl() {
+  local manifest="$_APPLY_TARGET_DIR/.claude/.applied-profiles.json"
+  [[ -f "$manifest" ]] || die "No hay manifest en este target ($manifest). El perfil '$_APPLY_PROFILE' no fue aplicado con una versión que trackee archivos."
+
+  jq -e --arg p "$_APPLY_PROFILE" '.[$p]' "$manifest" >/dev/null 2>&1 \
+    || die "El perfil '$_APPLY_PROFILE' no está registrado en el manifest de este target."
+
+  local files; files="$(jq -r --arg p "$_APPLY_PROFILE" '.[$p].files[]' "$manifest")"
+  local count; count="$(wc -l <<< "$files" | tr -d ' ')"
+
+  _apply_section "uninstalling"
+  log_info "removiendo $count items aplicados por el perfil '$_APPLY_PROFILE'"
+
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local dst="$_APPLY_TARGET_DIR/$rel"
+    if [[ -e "$dst" ]]; then
+      _apply_do_cmd rm -rf "$dst"
+      echo "    - $rel"
+    else
+      log_warn "    $rel (ya no existía)"
+    fi
+  done <<< "$files"
+
+  local claude_md="$_APPLY_TARGET_DIR/CLAUDE.md"
+  if [[ -f "$claude_md" ]]; then
+    local marker="<!-- apply-profile: $_APPLY_PROFILE -->"
+    local emarker="<!-- /apply-profile: $_APPLY_PROFILE -->"
+    if grep -Fq "$marker" "$claude_md"; then
+      log_info "removiendo sección del perfil de CLAUDE.md"
+      if (( _APPLY_DRY_RUN == 0 )); then
+        local tmp; tmp="$(mktemp)"
+        awk -v m="$marker" -v e="$emarker" '
+          $0 == m {skip=1; next}
+          $0 == e {skip=0; next}
+          !skip {print}
+        ' "$claude_md" > "$tmp"
+        mv "$tmp" "$claude_md"
+      fi
+    fi
+  fi
+
+  if (( _APPLY_DRY_RUN == 0 )); then
+    local tmp; tmp="$(mktemp)"
+    jq --arg p "$_APPLY_PROFILE" 'del(.[$p])' "$manifest" > "$tmp"
+    if [[ "$(jq 'length' "$tmp")" == "0" ]]; then
+      rm -f "$manifest" "$tmp"
+    else
+      mv "$tmp" "$manifest"
+    fi
+  fi
+
+  log_warn "NOTA: settings.json y mcp.json NO se tocaron — revisá a mano si querés limpiar."
+  log_ok "perfil '$_APPLY_PROFILE' desinstalado del target"
+}
+
+# cmd: apply <profile> [--force|--dry-run|--uninstall]
+cmd_apply() {
+  _APPLY_PROFILE=""
+  _APPLY_FORCE=0
+  _APPLY_DRY_RUN=0
+  local uninstall=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)     _APPLY_FORCE=1; shift ;;
+      --dry-run)   _APPLY_DRY_RUN=1; shift ;;
+      --uninstall) uninstall=1; shift ;;
+      -*)          die "flag desconocido: $1" ;;
+      *)
+        [[ -z "$_APPLY_PROFILE" ]] || die "solo un perfil a la vez (ya: '$_APPLY_PROFILE')"
+        _APPLY_PROFILE="$1"; shift
+        ;;
+    esac
+  done
+
+  [[ -z "$_APPLY_PROFILE" ]] && die "falta nombre del perfil. Ver: ccp profile list"
+
+  _APPLY_PROFILE_DIR="$PROFILES_DIR/$_APPLY_PROFILE"
+  _APPLY_TARGET_DIR="$(pwd)"
+  _APPLIED_FILES=()
+
+  if [[ ! -d "$_APPLY_PROFILE_DIR" ]]; then
+    log_err "Perfil no encontrado: $_APPLY_PROFILE"
+    log_info "Perfiles disponibles:"
+    for d in "$PROFILES_DIR"/*/; do
+      [[ -d "$d" ]] || continue
+      local n; n="$(basename "$d")"
+      [[ "$n" == "_"* ]] && continue
+      echo "  - $n"
+    done
+    exit 1
+  fi
+
+  require_cmd jq "brew install jq"
+
+  # Safety rails: SOLO para apply (no para otros subcomandos).
+  [[ "$_APPLY_TARGET_DIR" == "$REPO_ROOT" ]] && {
+    log_info "Cambia a tu proyecto target con: cd /ruta/a/tu/proyecto"
+    die "No se puede aplicar un perfil dentro del propio repo configure-claude-code."
+  }
+  [[ "$_APPLY_TARGET_DIR" == "$HOME/.claude" ]] && \
+    die "No se puede aplicar un perfil sobre ~/.claude/ (eso es la config global)."
+
+  # Header
+  local mode_meta=""
+  (( _APPLY_FORCE ))   && mode_meta="mode: FORCE"
+  (( _APPLY_DRY_RUN )) && mode_meta="${mode_meta:+$mode_meta · }mode: DRY-RUN"
+  banner "APPLY ▸ $_APPLY_PROFILE" "$mode_meta"
+  printf "  %bsource%b  %s\n" "$C_GRAY" "$C_RESET" "$_APPLY_PROFILE_DIR"
+  printf "  %btarget%b  %b%s%b\n" "$C_GRAY" "$C_RESET" "$C_ACID" "$_APPLY_TARGET_DIR" "$C_RESET"
+  echo
+
+  # Uninstall path
+  if (( uninstall )); then
+    _apply_uninstall_impl
+    hr "─" "$C_DARK"
+    return 0
+  fi
+
+  # Install path
+  _apply_claude_md
+  _apply_settings
+  _apply_mcp
+  _apply_copy_files "rules/*.md"          "rules"      ".claude/rules"       "*.md"
+  _apply_copy_files "skills/<name>/"      "skills"     ".claude/skills"      "*"
+  _apply_copy_files "agents/*.md"         "agents"     ".claude/agents"      "*.md"
+  _apply_copy_files "commands/*.md"       "commands"   ".claude/commands"    "*.md"
+  _apply_copy_files "references/*.md"     "references" ".claude/references"  "*.md"
+  _apply_copy_files "scripts/*"           "scripts"    ".claude/scripts"     "*"
+
+  if (( _APPLY_DRY_RUN == 0 && ${#_APPLIED_FILES[@]} > 0 )); then
+    _apply_write_target_manifest
+  fi
+
+  # Footer
+  hr "─" "$C_DARK"
+  if (( _APPLY_DRY_RUN )); then
+    printf "  %b◈ DRY-RUN TERMINADO%b · nada fue escrito\n" "$C_WARN" "$C_RESET"
+    printf "  %brun%b         %b%s%b\n" "$C_GRAY" "$C_RESET" "$C_ACID" "ccp apply $_APPLY_PROFILE" "$C_RESET"
+  else
+    printf "  %b◉ PERFIL '%s' APLICADO%b  (%d archivos trackeados)\n" "$C_OK" "$_APPLY_PROFILE" "$C_RESET" "${#_APPLIED_FILES[@]}"
+    printf "  %brevisar%b     %bls -la .claude/ CLAUDE.md .mcp.json%b\n" "$C_GRAY" "$C_RESET" "$C_ACID" "$C_RESET"
+    printf "  %bgitignore%b   %b.claude/settings.local.json   .claude/.applied-profiles.json%b\n" "$C_GRAY" "$C_RESET" "$C_ACID" "$C_RESET"
+    printf "  %buninstall%b   %bccp apply %s --uninstall%b\n" "$C_GRAY" "$C_RESET" "$C_ACID" "$_APPLY_PROFILE" "$C_RESET"
+    printf "  %bcommit%b      cambios en .claude/ + CLAUDE.md + .mcp.json\n" "$C_GRAY" "$C_RESET"
+  fi
+  hr "─" "$C_DARK"
+  echo
+}
+
+# cmd: profile list — muestra perfiles disponibles
+cmd_profile_list() {
+  banner "PERFILES" "disponibles en $PROFILES_DIR"
+  if [[ ! -d "$PROFILES_DIR" ]]; then
+    printf "  %b(vacío — no hay perfiles todavía)%b\n\n" "$C_DIM" "$C_RESET"
+    return 0
+  fi
+  local found=0 dir name desc
+  for dir in "$PROFILES_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    name="$(basename "$dir")"
+    [[ "$name" == "_"* ]] && continue
+    found=1
+    desc=""
+    if [[ -f "$dir/profile.json" ]]; then
+      desc="$(jq -r '.description // ""' "$dir/profile.json" 2>/dev/null || echo "")"
+    fi
+    item "$name" "$desc"
+  done
+  (( found == 0 )) && printf "  %b(sin perfiles)%b\n" "$C_DIM" "$C_RESET"
+  echo
+}
+
+cmd_draft_history() {
+  _drafts_init
+  local count; count="$(jq 'length' "$DRAFTS_HISTORY")"
+  banner "DRAFTS HISTORY" "($count installs)"
+  if [[ "$count" == "0" ]]; then
+    printf "  %b(vacío)%b\n\n" "$C_DIM" "$C_RESET"
+    return 0
+  fi
+  jq -r '.[] | "\(.installed_at)\t\(.type)\t\(.name)\t\(.profile)"' "$DRAFTS_HISTORY" | sort -r | \
+  while IFS=$'\t' read -r ts t n p; do
+    printf "  %b◆%b  %b%s%b  %s · %s → %b%s%b\n" \
+      "$C_NEON" "$C_RESET" "$C_ACID" "$ts" "$C_RESET" "$t" "$n" "$C_ELEC" "$p" "$C_RESET"
+  done
+  echo
+}
+
+# ---------- Dispatch ----------
+# Si se hace `source ccp` desde tests con CCP_LIB=1 (alias: PROFILE_SH_LIB), no dispatch.
+if [[ "${CCP_LIB:-${PROFILE_SH_LIB:-}}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+if [[ $# -eq 0 ]]; then usage; exit 1; fi
+
+run_list() {
+  local kind="$1" profile="$2"
+  case "$kind" in
+    skill)     cmd_skill_list     "$profile" ;;
+    agent)     cmd_agent_list     "$profile" ;;
+    command)   cmd_command_list   "$profile" ;;
+    reference) cmd_reference_list "$profile" ;;
+    rule)      cmd_rule_list      "$profile" ;;
+    script)    cmd_script_list    "$profile" ;;
+    mcp)       cmd_mcp_list       "$profile" ;;
+    *) die "Tipo desconocido: $kind";;
+  esac
+}
+
+run_add() {
+  local kind="$1"; shift
+  case "$kind" in
+    skill)     cmd_skill_add     "$@" ;;
+    agent)     cmd_agent_add     "$@" ;;
+    command)   cmd_command_add   "$@" ;;
+    reference) cmd_reference_add "$@" ;;
+    rule)      cmd_rule_add      "$@" ;;
+    script)    cmd_script_add    "$@" ;;
+    mcp)       cmd_mcp_add       "$@" ;;
+    *) die "Tipo desconocido: $kind";;
+  esac
+}
+
+run_remove() {
+  local kind="$1"; shift
+  case "$kind" in
+    skill)     cmd_skill_remove     "$@" ;;
+    agent)     cmd_agent_remove     "$@" ;;
+    command)   cmd_command_remove   "$@" ;;
+    reference) cmd_reference_remove "$@" ;;
+    rule)      cmd_rule_remove      "$@" ;;
+    script)    cmd_script_remove    "$@" ;;
+    mcp)       cmd_mcp_remove       "$@" ;;
+    *) die "Tipo desconocido: $kind";;
+  esac
+}
+
+case "$1" in
+  --help|-h) usage; exit 0 ;;
+  profile)
+    shift
+    [[ $# -eq 0 ]] && die "Falta subcomando (create/list)"
+    case "$1" in
+      create) shift; [[ $# -ge 1 ]] || die "uso: profile create <name> [--description X] [--stack A,B]"; cmd_profile_create "$@" ;;
+      list)   shift; cmd_profile_list ;;
+      *) die "Subcomando desconocido: $1 (usá: create/list)" ;;
+    esac
+    ;;
+  apply) shift; cmd_apply "$@" ;;
+  pack)
+    shift
+    [[ $# -eq 0 ]] && die "Falta subcomando (install/update/remove/list/adopt)"
+    case "$1" in
+      list)    shift; [[ $# -eq 1 ]] || { die "uso: pack list <profile>"; };                  cmd_pack_list    "$1" ;;
+      install) shift; [[ $# -ge 2 ]] || { die "uso: pack install <profile> <url> [--branch X|--tag X|--pin SHA] [--dry-run]"; }; cmd_pack_install "$@" ;;
+      update)  shift; [[ $# -ge 2 ]] || { die "uso: pack update <profile> <pack|--all> [--dry-run]"; }; cmd_pack_update "$@" ;;
+      remove)  shift; [[ $# -ge 2 ]] || { die "uso: pack remove <profile> <pack> [--dry-run]"; };       cmd_pack_remove "$@" ;;
+      adopt)   shift; [[ $# -eq 2 ]] || { die "uso: pack adopt <profile> <url>"; };                     cmd_pack_adopt   "$1" "$2" ;;
+      *) usage; die "Subcomando desconocido: $1" ;;
+    esac
+    ;;
+  inventory) shift; [[ $# -eq 1 ]] || { die "uso: inventory <profile>"; }; cmd_inventory "$1" ;;
+  draft)
+    shift
+    [[ $# -eq 0 ]] && die "Falta subcomando (create/refine/install/list/discard/history)"
+    case "$1" in
+      create)   shift; [[ $# -eq 2 ]] || die "uso: draft create <type> <name>";             cmd_draft_create   "$1" "$2" ;;
+      refine)   shift; [[ $# -eq 2 ]] || die "uso: draft refine <type> <name>";             cmd_draft_refine   "$1" "$2" ;;
+      install)  shift; [[ $# -eq 3 ]] || die "uso: draft install <type> <name> <profile[,profile2...]>"; cmd_draft_install "$1" "$2" "$3" ;;
+      discard)  shift; [[ $# -eq 2 ]] || die "uso: draft discard <type> <name>";            cmd_draft_discard  "$1" "$2" ;;
+      list)     shift; cmd_draft_list "$@" ;;
+      history)  shift; cmd_draft_history ;;
+      *) die "Subcomando desconocido: $1 (usá create/refine/install/list/discard/history)" ;;
+    esac
+    ;;
+  skill|agent|command|reference|rule|script|mcp)
+    kind="$1"; shift
+    [[ $# -ge 1 ]] || { die "uso: $kind {list|add|remove|add-json} ..."; }
+    subcmd="$1"; shift
+    case "$subcmd" in
+      list)
+        [[ $# -eq 1 ]] || { die "uso: $kind list <profile>"; }
+        run_list "$kind" "$1"
+        ;;
+      add)
+        if [[ "$kind" == "mcp" ]]; then
+          [[ $# -ge 3 ]] || { die "uso: mcp add <profile> <name> <command> [args]..."; }
+        else
+          [[ $# -ge 2 ]] || { die "uso: $kind add <profile> <name> [--from <url>]"; }
+        fi
+        run_add "$kind" "$@"
+        ;;
+      add-json)
+        [[ "$kind" == "mcp" ]] || { die "add-json solo aplica a mcp"; }
+        [[ $# -eq 3 ]] || { die "uso: mcp add-json <profile> <name> '<json>'"; }
+        cmd_mcp_add_json "$1" "$2" "$3"
+        ;;
+      remove)
+        [[ $# -eq 2 ]] || { die "uso: $kind remove <profile> <name>"; }
+        run_remove "$kind" "$@"
+        ;;
+      *) die "Subcomando desconocido: $subcmd (usá list/add/remove/add-json)";;
+    esac
+    ;;
+  *) usage; die "Comando desconocido: $1" ;;
+esac

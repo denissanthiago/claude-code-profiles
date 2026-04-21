@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm *)",
+      "Bash(npm run *)",
+      "Bash(bun *)",
+      "Bash(yarn *)",
+      "Bash(npx tsc *)",
+      "Bash(ffmpeg -version)",
+      "Bash(ffmpeg -i * -c:v * -c:a * *)",
+      "Bash(ffprobe *)"
+    ],
+    "deny": [
+      "Edit(.env*)",
+      "Write(.env*)",
+      "Edit(*-lock.*)",
+      "Edit(node_modules/**)",
+      "Edit(out/**)",
+      "Edit(render/**)",
+      "Edit(build/**)",
+      "Bash(git push origin main *)",
+      "Bash(git push origin master *)"
+    ]
+  }
+}
